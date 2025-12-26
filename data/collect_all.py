@@ -567,14 +567,14 @@ class MultithreadedCollector:
         self.db.save_mapping(mapping)
         return mapping
 
-    def run(self):
+    def run(self, backfill_only: bool = False):
         """Run collection."""
         if RICH_AVAILABLE:
-            self._run_with_rich()
+            self._run_with_rich(backfill_only)
         else:
-            self._run_basic()
+            self._run_basic(backfill_only)
 
-    def _run_basic(self):
+    def _run_basic(self, backfill_only: bool = False):
         """Run with basic console output."""
         print("\n=== Multithreaded Data Collection ===")
         print(f"Workers: {self.num_workers}")
@@ -647,6 +647,12 @@ class MultithreadedCollector:
             self._save_checkpoint()
             print(f"\nBackfill complete! {self.stats.items_completed} items, {self.stats.total_records:,} records")
 
+        # Exit if backfill only
+        if backfill_only:
+            print("\n=== Backfill Only Mode - Exiting ===")
+            self._print_summary()
+            return
+
         # Phase 2: Continuous collection
         print("\n=== Continuous Collection ===")
         print("Press Ctrl+C to stop\n")
@@ -696,7 +702,7 @@ class MultithreadedCollector:
         print("\nShutdown complete.")
         self._print_summary()
 
-    def _run_with_rich(self):
+    def _run_with_rich(self, backfill_only: bool = False):
         """Run with rich console output."""
         console = Console()
 
@@ -798,6 +804,12 @@ class MultithreadedCollector:
             console.print(f"  • Records: {self.stats.total_records:,}")
             console.print(f"  • Errors: {self.stats.errors}")
             console.print(f"  • Avg speed: {self.stats.requests_per_sec():.1f} req/s")
+
+        # Exit if backfill only
+        if backfill_only:
+            console.print(f"\n[bold yellow]Backfill Only Mode - Exiting[/bold yellow]")
+            self._print_summary_rich(console)
+            return
 
         # Phase 2
         console.print(f"\n[bold cyan]Phase 2: Continuous Collection[/bold cyan]")
@@ -907,10 +919,11 @@ Examples:
     parser.add_argument("--email", "-e", required=True, help="Contact email (REQUIRED)")
     parser.add_argument("--db", "-d", default="ge_prices.db", help="Database path")
     parser.add_argument("--checkpoint", "-c", default="collection_checkpoint.json", help="Checkpoint path")
-    parser.add_argument("--workers", "-w", type=int, default=3, help="Number of workers (default: 3)")
-    parser.add_argument("--rps", type=float, default=10.0, help="Max requests per second (default: 10)")
+    parser.add_argument("--workers", "-w", type=int, default=8, help="Number of workers (default: 8)")
+    parser.add_argument("--rps", type=float, default=20.0, help="Max requests per second (default: 20)")
     parser.add_argument("--fresh", action="store_true", help="Start fresh, ignore checkpoint")
     parser.add_argument("--stats", action="store_true", help="Show stats and exit")
+    parser.add_argument("--backfill-only", action="store_true", help="Exit after backfill (skip Phase 2)")
 
     args = parser.parse_args()
 
@@ -937,7 +950,7 @@ Examples:
         return
 
     try:
-        collector.run()
+        collector.run(backfill_only=args.backfill_only)
     except KeyboardInterrupt:
         print("\nInterrupted")
     finally:
