@@ -46,17 +46,21 @@ logger = logging.getLogger("TrainingDataExport")
 class TrainingDataExporter:
     """Exports collected price data for PPO training."""
 
-    # Feature columns for training
+    # Feature columns for training (matches compute_features output order)
     PRICE_FEATURES = [
-        "avg_high_price",
-        "avg_low_price",
-        "high_price_volume",
-        "low_price_volume",
+        "timestamp",        # Unix timestamp (column 0, excluded from training)
+        "avg_high_price",   # Average instant-buy price
+        "avg_low_price",    # Average instant-sell price
+        "high_price_volume",# Volume of instant-buys
+        "low_price_volume", # Volume of instant-sells
         "spread",           # high - low
         "spread_pct",       # spread / avg_price
         "volume_ratio",     # high_vol / low_vol
         "total_volume"      # high_vol + low_vol
     ]
+
+    # Features used for training (excludes timestamp)
+    TRAINING_FEATURES = PRICE_FEATURES[1:]
 
     def __init__(self, db_path: str):
         """
@@ -372,7 +376,7 @@ class TrainingDataExporter:
             output_path,
             X=X_combined,
             y=y_combined,
-            feature_names=self.PRICE_FEATURES,
+            feature_names=self.TRAINING_FEATURES,
             item_metadata=json.dumps(item_metadata),
             normalization_params=json.dumps(norm_params),
             sequence_length=sequence_length,
