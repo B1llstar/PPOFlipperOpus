@@ -11,7 +11,7 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 # Start backend server in background
 echo "Starting backend server on http://localhost:8000..."
 cd "$PROJECT_ROOT"
-python dashboard/backend/server.py &
+python3 dashboard/backend/server.py &
 BACKEND_PID=$!
 
 # Wait for backend to start

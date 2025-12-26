@@ -128,18 +128,19 @@ class GrandExchangeEnv(gym.Env):
     GE_TAX_RATE = 0.01  # 1% GE tax on sells
     GE_SLOTS = 8  # Number of GE slots available
     MAX_ITEMS_TRACKED = 100  # Top items to track
-    LOOKBACK_PERIODS = 24  # Hours of history in observation
+    LOOKBACK_PERIODS = 24  # Days of history in observation (when using 24h data)
 
     def __init__(
         self,
         db_path: str,
         initial_cash: float = 10_000_000,  # 10M GP starting capital
-        episode_length: int = 168,  # 1 week of hourly steps
+        episode_length: int = 168,  # Number of steps per episode
         top_n_items: int = 50,  # Number of items to trade
         ge_limit_multiplier: float = 1.0,  # Scale GE limits (1.0 = realistic)
         include_volume_constraint: bool = True,
         render_mode: Optional[str] = None,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        timestep: str = "24h"  # "24h" for daily data (365 days) or "1h" for hourly (365 hours)
     ):
         super().__init__()
 
@@ -150,6 +151,7 @@ class GrandExchangeEnv(gym.Env):
         self.ge_limit_multiplier = ge_limit_multiplier
         self.include_volume_constraint = include_volume_constraint
         self.render_mode = render_mode
+        self.timestep = timestep  # "24h" or "1h"
 
         # Load market data
         self._load_market_data()
@@ -164,6 +166,7 @@ class GrandExchangeEnv(gym.Env):
 
     def _load_market_data(self):
         """Load historical market data from database."""
+        print(f"[DEBUG] Loading market data from: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -177,6 +180,7 @@ class GrandExchangeEnv(gym.Env):
             row[0]: {"name": row[1], "ge_limit": row[2], "highalch": row[3]}
             for row in cursor.fetchall()
         }
+        print(f"[DEBUG] Loaded {len(self.item_metadata)} items from metadata")
 
         # Get items with most trading data (top by volume)
         cursor.execute("""
@@ -190,9 +194,17 @@ class GrandExchangeEnv(gym.Env):
 
         self.tradeable_items = [row[0] for row in cursor.fetchall()]
         self.item_to_idx = {item_id: idx for idx, item_id in enumerate(self.tradeable_items)}
+        print(f"[DEBUG] Found {len(self.tradeable_items)} tradeable items by volume")
+
+        if not self.tradeable_items:
+            print("[DEBUG] ERROR: No tradeable items found! Checking database...")
+            cursor.execute("SELECT COUNT(*) FROM timeseries WHERE timestep = '1h'")
+            print(f"[DEBUG] Total 1h timeseries rows: {cursor.fetchone()[0]}")
+            cursor.execute("SELECT DISTINCT timestep FROM timeseries")
+            print(f"[DEBUG] Available timesteps: {cursor.fetchall()}")
 
         # Load all timeseries data for these items
-        placeholders = ",".join("?" * len(self.tradeable_items))
+        placeholders = ",".join("?" * len(self.tradeable_items)) if self.tradeable_items else "0"
         cursor.execute(f"""
             SELECT item_id, timestamp, avg_high_price, high_price_volume,
                    avg_low_price, low_price_volume
@@ -230,11 +242,19 @@ class GrandExchangeEnv(gym.Env):
 
         # Filter items with enough data
         min_data_points = self.episode_length + self.LOOKBACK_PERIODS
+        print(f"[DEBUG] Filtering items with >= {min_data_points} data points")
+
+        items_before = len(self.tradeable_items)
+        data_counts = [(item_id, len(self.market_history[item_id])) for item_id in self.tradeable_items]
+        print(f"[DEBUG] Data points per item (first 5): {data_counts[:5]}")
+
         self.tradeable_items = [
             item_id for item_id in self.tradeable_items
             if len(self.market_history[item_id]) >= min_data_points
         ]
         self.item_to_idx = {item_id: idx for idx, item_id in enumerate(self.tradeable_items)}
+
+        print(f"[DEBUG] After filtering: {items_before} -> {len(self.tradeable_items)} items")
 
         logger.info(f"Loaded {len(self.tradeable_items)} items with sufficient data")
         logger.info(f"Timeline: {len(self.all_timestamps)} hourly data points")

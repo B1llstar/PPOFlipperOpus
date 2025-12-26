@@ -25,7 +25,7 @@ import uvicorn
 # Add parent directories to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from config import ENV_KWARGS, PPO_KWARGS, TRAIN_KWARGS
+from ppo_config import ENV_KWARGS, PPO_KWARGS, TRAIN_KWARGS
 
 
 class TrainingState(str, Enum):
@@ -285,34 +285,61 @@ class TrainingManager:
             # Import training components
             from training.ge_environment import GrandExchangeEnv
             from ppo_agent import PPOAgent
-            from config import ENV_KWARGS, PPO_KWARGS
+            from ppo_config import ENV_KWARGS, PPO_KWARGS
 
             import torch
             import numpy as np
 
             device = PPO_KWARGS.get('device', 'cpu')
+            print(f"Using device: {device}")
 
             # Create environments and agents for each agent
             envs = []
             agents = []
 
-            # Load items (simplified for now)
-            items = self._load_items()
+            # Database path - relative to this file's location
+            # server.py is in dashboard/backend/, so go up 2 levels to project root
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(script_dir))
+            db_path = os.path.join(project_root, 'ge_prices.db')
+            print(f"Database path: {db_path}")
+            print(f"Database exists: {os.path.exists(db_path)}")
+
+            if not os.path.exists(db_path):
+                raise FileNotFoundError(f"Database not found at {db_path}")
 
             for i in range(self.num_agents):
+                print(f"Creating environment {i+1}/{self.num_agents}...")
                 env = GrandExchangeEnv(
-                    items=items,
-                    starting_gp=ENV_KWARGS.get('starting_gp', 10_000_000),
-                    max_steps=ENV_KWARGS.get('max_steps', 1000),
-                    ge_tax_rate=ENV_KWARGS.get('ge_tax_rate', 0.01),
-                    ge_slots=ENV_KWARGS.get('ge_slots', 8),
+                    db_path=db_path,
+                    initial_cash=ENV_KWARGS.get('starting_gp', 10_000_000),
+                    episode_length=ENV_KWARGS.get('max_steps', 168),
+                    top_n_items=50,
                 )
+                print(f"Environment {i+1} created. Tradeable items: {len(env.tradeable_items)}")
                 envs.append(env)
 
-                obs_dim = env.observation_space.shape[0] if hasattr(env.observation_space, 'shape') else 100
+                # Build item_list, price_ranges, buy_limits from environment
+                item_list = [f"Item_{item_id}" for item_id in env.tradeable_items]
+                price_ranges = {}
+                buy_limits = {}
+                for item_id in env.tradeable_items:
+                    meta = env.item_metadata.get(item_id, {})
+                    # Get price range from market history
+                    history = env.market_history.get(item_id, [])
+                    if history:
+                        min_price = min(s.low_price for s in history)
+                        max_price = max(s.high_price for s in history)
+                    else:
+                        min_price, max_price = 1, 1000000
+                    price_ranges[f"Item_{item_id}"] = (min_price, max_price)
+                    buy_limits[f"Item_{item_id}"] = meta.get('ge_limit', 10000)
+
                 agent = PPOAgent(
-                    state_dim=obs_dim,
-                    num_items=len(items),
+                    item_list=item_list,
+                    price_ranges=price_ranges,
+                    buy_limits=buy_limits,
+                    device=torch.device(device),
                     hidden_size=PPO_KWARGS.get('hidden_size', 256),
                     num_layers=PPO_KWARGS.get('num_layers', 3),
                     price_bins=PPO_KWARGS.get('price_bins', 21),
@@ -324,9 +351,10 @@ class TrainingManager:
                     entropy_coef=PPO_KWARGS.get('entropy_coef', 0.01),
                     value_coef=PPO_KWARGS.get('value_coef', 0.5),
                     max_grad_norm=PPO_KWARGS.get('max_grad_norm', 0.5),
-                    device=device,
+                    agent_id=i,
                 )
                 agents.append(agent)
+                print(f"Agent {i+1} created with {len(item_list)} items")
 
             # Initialize observations
             observations = [env.reset()[0] for env in envs]
@@ -345,44 +373,43 @@ class TrainingManager:
 
                 # Run one step for each agent
                 for i, (env, agent, obs) in enumerate(zip(envs, agents, observations)):
-                    # Get action
-                    obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        action, log_prob, value = agent.get_action_and_value(obs_tensor)
+                    # Get action from policy - sample from action space for now
+                    # The environment expects actions of shape (n_items, 3)
+                    action = env.action_space.sample()
 
-                    # Decode and execute action
-                    action_dict = agent.decode_action(action, list(items.keys()))
-                    next_obs, reward, terminated, truncated, info = env.step(action_dict)
+                    next_obs, reward, terminated, truncated, info = env.step(action)
                     done = terminated or truncated
 
                     episode_rewards[i] += reward
                     episode_steps[i] += 1
 
+                    # Get holdings from positions
+                    holdings = {}
+                    for item_id, position in env.positions.items():
+                        if position.quantity > 0:
+                            holdings[f"Item_{item_id}"] = position.quantity
+
                     # Update agent metrics
                     self.update_agent(
                         i,
-                        cash=env.gp,
-                        portfolio_value=env.get_portfolio_value() - env.gp,
-                        holdings=dict(env.inventory),
+                        cash=env.cash,
+                        portfolio_value=info.get('total_value', env.cash) - env.cash,
+                        holdings=holdings,
                         pending_orders=[],
                         step=episode_steps[i],
                         episode=episode,
-                        current_action=f"{action_dict.get('type', 'hold')} {action_dict.get('item', '')}".strip(),
+                        current_action=f"step {episode_steps[i]}",
                     )
 
-                    # Log trade if executed
-                    if info.get('trade_executed'):
-                        self.log_trade(i, {
-                            'type': action_dict.get('type'),
-                            'item': action_dict.get('item'),
-                            'price': action_dict.get('price'),
-                            'quantity': action_dict.get('quantity'),
-                            'profit': info.get('profit', 0),
-                            'tax': info.get('tax', 0),
-                        })
-                        self.update_agent(i, trades_executed=self.agents[i].trades_executed + 1)
-                        if info.get('profit', 0) > 0:
-                            self.update_agent(i, profitable_trades=self.agents[i].profitable_trades + 1)
+                    # Track trades from info
+                    if info.get('total_trades', 0) > self.agents[i].trades_executed:
+                        new_trades = info['total_trades'] - self.agents[i].trades_executed
+                        self.update_agent(i, trades_executed=info['total_trades'])
+
+                        # Estimate profitable trades from win rate
+                        win_rate = info.get('win_rate', 0)
+                        profitable = int(info['total_trades'] * win_rate)
+                        self.update_agent(i, profitable_trades=profitable)
 
                     if done:
                         # Episode complete for this agent

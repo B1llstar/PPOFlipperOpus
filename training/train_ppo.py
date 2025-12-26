@@ -69,7 +69,7 @@ from volume_analysis import VolumeAnalyzer, create_volume_analyzer, update_volum
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ppo_agent import PPOAgent
-from config import ENV_KWARGS, PPO_KWARGS
+from ppo_config import ENV_KWARGS, PPO_KWARGS
 from tax_log import log_tax_payment, log_tax_summary, create_tax_report
 from api.ge_rest_client import GrandExchangeClient
 
