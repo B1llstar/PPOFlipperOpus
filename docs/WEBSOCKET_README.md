@@ -34,11 +34,19 @@ The WebSocket implementation consists of the following components:
 
 ### Prerequisites
 
-Make sure you have the following dependencies installed:
+The WebSocket dependencies are included in the main project. If you're using uv:
 
 ```bash
-pip install websockets fastapi uvicorn aiohttp
+uv sync
 ```
+
+Or if you need to install them separately:
+
+```bash
+uv pip install websockets fastapi uvicorn aiohttp
+```
+
+> **Note**: For pip users: `pip install websockets fastapi uvicorn aiohttp`
 
 ### Running the WebSocket Server
 

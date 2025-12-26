@@ -55,7 +55,7 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-    print("Note: Install 'rich' for better progress display: pip install rich")
+    print("Note: Install 'rich' for better progress display: uv pip install rich")
 
 # Configure logging
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')

@@ -1,0 +1,16 @@
+[project]
+name = "ppo-flipper-dashboard-backend"
+version = "0.1.0"
+description = "Backend server for PPO Flipper Opus dashboard"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

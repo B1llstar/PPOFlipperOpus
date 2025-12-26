@@ -31,9 +31,23 @@ PPOFlipperOpus/
 
 ### 1. Install Dependencies
 
+This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable Python package management.
+
 ```bash
-pip install -r requirements.txt
+# Install uv if you haven't already (Windows)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Or on Unix-like systems
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install project dependencies
+uv sync
+
+# Or if you want to install with optional dependencies
+uv sync --extra analysis --extra export
 ```
+
+> **Note**: If you prefer using pip, a `requirements.txt` file is still available for compatibility.
 
 ### 2. Collect Training Data
 
