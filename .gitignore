@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files
+*.db
+*.sqlite
+*.sqlite3
+*.npz
+*.parquet
+training_csv/
+training_data/
+
+# Logs
+*.log
+logs/
+
+# Config with secrets
+.env
+*.env
+credentials.json
+
+# Model checkpoints
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+
+# OS files
+.DS_Store
+Thumbs.db
