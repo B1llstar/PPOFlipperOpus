@@ -59,16 +59,23 @@ def start_logging_listener(log_queue):
     return listener
 
 logger = setup_logger()
-from ge_env import GrandExchangeEnv
+
+# Local imports from training directory
+from ge_environment import GrandExchangeEnv
+from shared_knowledge import SharedKnowledgeRepository
+from volume_analysis import VolumeAnalyzer, create_volume_analyzer, update_volume_analyzer, get_volume_metrics_for_item
+
+# Parent directory imports
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ppo_agent import PPOAgent
 from config import ENV_KWARGS, PPO_KWARGS
-import json
-from ge_rest_client import GrandExchangeClient
-from shared_knowledge import SharedKnowledgeRepository
 from tax_log import log_tax_payment, log_tax_summary, create_tax_report
+from api.ge_rest_client import GrandExchangeClient
+
+import json
 import threading
 import time
-from volume_analysis import VolumeAnalyzer, create_volume_analyzer, update_volume_analyzer, get_volume_metrics_for_item
 
 # Function to manage volume blacklist log file
 def manage_volume_blacklist_log(content, mode='a', max_entries=1000):
@@ -1210,7 +1217,9 @@ def main():
 def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, ppo_kwargs, use_historical_data=False, volume_analyzer=None):
     logger = setup_logger(log_queue)
     import os
-    from ge_rest_client import GrandExchangeClient, HistoricalGrandExchangeClient
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from api.ge_rest_client import GrandExchangeClient, HistoricalGrandExchangeClient
     
     # Create name-to-id and id-to-name mappings
     id_name_map, _ = read_mapping_file()
