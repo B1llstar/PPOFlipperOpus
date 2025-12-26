@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """
-Aggressive Data Collection Script
+Multithreaded Data Collection Script
 
 Collects maximum historical data with:
+- Multithreaded parallel requests (configurable workers)
+- Global rate limiter shared across all threads
 - Automatic rate limit detection and backoff
 - Progress checkpoints (resume on crash/restart)
-- Parallel collection where safe
 - Real-time progress indicators
-- Data integrity verification
+- Thread-safe database writes
 
 Usage:
     python data/collect_all.py --email your@email.com
 
+    # Use 5 parallel workers (default: 3)
+    python data/collect_all.py --email your@email.com --workers 5
+
     # Resume from checkpoint
     python data/collect_all.py --email your@email.com --resume
 
-    # Specify number of parallel workers
-    python data/collect_all.py --email your@email.com --workers 3
+    # Aggressive mode (10 workers, faster but riskier)
+    python data/collect_all.py --email your@email.com --workers 10 --rps 15
 """
 
 import argparse
-import asyncio
 import json
 import logging
 import os
+import queue
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -42,30 +47,35 @@ from api.ge_rest_client import GrandExchangeClient, GrandExchangeAPIError, RateL
 # Rich console for pretty output (fallback to basic if not installed)
 try:
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn, TaskProgressColumn
     from rich.table import Table
     from rich.live import Live
     from rich.panel import Panel
+    from rich.layout import Layout
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
     print("Note: Install 'rich' for better progress display: pip install rich")
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('collect_all.log'),
-        logging.StreamHandler()
-    ]
-)
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler = logging.FileHandler('collect_all.log')
+file_handler.setFormatter(log_formatter)
+
 logger = logging.getLogger("CollectAll")
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+
+# Only add stream handler if rich is not available (rich handles console output)
+if not RICH_AVAILABLE:
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(log_formatter)
+    logger.addHandler(stream_handler)
 
 
 @dataclass
 class CollectionStats:
-    """Track collection statistics."""
+    """Thread-safe collection statistics."""
     started_at: float = field(default_factory=time.time)
     items_total: int = 0
     items_completed: int = 0
@@ -77,6 +87,16 @@ class CollectionStats:
     rate_limits_hit: int = 0
     total_records: int = 0
     last_save: float = field(default_factory=time.time)
+    active_workers: int = 0
+    requests_made: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def increment(self, **kwargs):
+        """Thread-safe increment of stats."""
+        with self._lock:
+            for key, value in kwargs.items():
+                if hasattr(self, key):
+                    setattr(self, key, getattr(self, key) + value)
 
     def elapsed(self) -> str:
         elapsed = time.time() - self.started_at
@@ -87,7 +107,13 @@ class CollectionStats:
     def rate(self) -> float:
         elapsed = time.time() - self.started_at
         if elapsed > 0:
-            return self.items_completed / elapsed * 60  # items per minute
+            return self.items_completed / elapsed * 60
+        return 0
+
+    def requests_per_sec(self) -> float:
+        elapsed = time.time() - self.started_at
+        if elapsed > 0:
+            return self.requests_made / elapsed
         return 0
 
 
@@ -99,17 +125,23 @@ class Checkpoint:
     last_hourly_collection: float = 0
     last_5m_collection: float = 0
     stats: Dict = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def add_completed(self, item_id: int):
+        """Thread-safe add completed item."""
+        with self._lock:
+            self.completed_items.add(item_id)
 
     def save(self, path: str = "collection_checkpoint.json"):
-        data = {
-            "phase": self.phase,
-            "completed_items": list(self.completed_items),
-            "last_hourly_collection": self.last_hourly_collection,
-            "last_5m_collection": self.last_5m_collection,
-            "stats": self.stats,
-            "saved_at": datetime.now().isoformat()
-        }
-        # Write to temp file first, then rename (atomic)
+        with self._lock:
+            data = {
+                "phase": self.phase,
+                "completed_items": list(self.completed_items),
+                "last_hourly_collection": self.last_hourly_collection,
+                "last_5m_collection": self.last_5m_collection,
+                "stats": self.stats,
+                "saved_at": datetime.now().isoformat()
+            }
         temp_path = path + ".tmp"
         with open(temp_path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -137,170 +169,101 @@ class Checkpoint:
             return cls()
 
 
-class RateLimitedClient:
-    """API client with intelligent rate limiting."""
+class GlobalRateLimiter:
+    """Thread-safe global rate limiter shared across all workers."""
 
-    def __init__(self, email: str, requests_per_second: float = 5.0):
-        self.client = GrandExchangeClient(contact_email=email)
+    def __init__(self, requests_per_second: float = 10.0):
         self.min_interval = 1.0 / requests_per_second
+        self.lock = threading.Lock()
         self.last_request = 0
         self.backoff_until = 0
         self.consecutive_errors = 0
+        self.total_requests = 0
 
         # Adaptive rate limiting
         self.current_interval = self.min_interval
-        self.max_interval = 5.0  # Max 5 seconds between requests
+        self.max_interval = 10.0
 
-    def _wait_for_rate_limit(self):
-        """Wait if we're rate limited or need to respect interval."""
-        now = time.time()
+    def acquire(self) -> float:
+        """
+        Acquire permission to make a request. Returns wait time.
+        Blocks until it's safe to make a request.
+        """
+        with self.lock:
+            now = time.time()
 
-        # Check if we're in backoff period
-        if now < self.backoff_until:
-            wait_time = self.backoff_until - now
-            logger.warning(f"Rate limit backoff: waiting {wait_time:.1f}s")
+            # Check backoff
+            if now < self.backoff_until:
+                wait_time = self.backoff_until - now
+            else:
+                # Calculate wait based on interval
+                elapsed = now - self.last_request
+                wait_time = max(0, self.current_interval - elapsed)
+
+            # Update last request time (projected)
+            self.last_request = now + wait_time
+            self.total_requests += 1
+
+            return wait_time
+
+    def wait(self):
+        """Acquire and wait."""
+        wait_time = self.acquire()
+        if wait_time > 0:
             time.sleep(wait_time)
 
-        # Respect minimum interval
-        elapsed = now - self.last_request
-        if elapsed < self.current_interval:
-            time.sleep(self.current_interval - elapsed)
+    def report_success(self):
+        """Report successful request - can speed up."""
+        with self.lock:
+            self.consecutive_errors = 0
+            self.current_interval = max(
+                self.min_interval,
+                self.current_interval * 0.95
+            )
 
-        self.last_request = time.time()
+    def report_error(self, is_rate_limit: bool = False):
+        """Report failed request - slow down."""
+        with self.lock:
+            self.consecutive_errors += 1
 
-    def _handle_success(self):
-        """Reduce interval on success."""
-        self.consecutive_errors = 0
-        # Gradually reduce interval back to minimum
-        self.current_interval = max(
-            self.min_interval,
-            self.current_interval * 0.9
-        )
+            if is_rate_limit:
+                backoff_time = min(120, 5 * (2 ** min(self.consecutive_errors, 5)))
+                self.backoff_until = time.time() + backoff_time
+                self.current_interval = min(self.max_interval, self.current_interval * 3)
+                logger.warning(f"Rate limit! All workers backing off for {backoff_time:.1f}s")
+            else:
+                self.current_interval = min(self.max_interval, self.current_interval * 1.2)
 
-    def _handle_error(self, is_rate_limit: bool = False):
-        """Increase interval on error."""
-        self.consecutive_errors += 1
-
-        if is_rate_limit:
-            # Exponential backoff for rate limits
-            backoff_time = min(60, 2 ** self.consecutive_errors)
-            self.backoff_until = time.time() + backoff_time
-            self.current_interval = min(self.max_interval, self.current_interval * 2)
-            logger.warning(f"Rate limit hit! Backing off for {backoff_time}s")
-        else:
-            # Smaller increase for other errors
-            self.current_interval = min(self.max_interval, self.current_interval * 1.5)
-
-    def get_mapping(self) -> List[Dict]:
-        """Get item mapping with rate limiting."""
-        self._wait_for_rate_limit()
-        try:
-            result = self.client.get_mapping()
-            self._handle_success()
-            return result
-        except Exception as e:
-            self._handle_error("429" in str(e) or "rate" in str(e).lower())
-            raise
-
-    def get_latest(self) -> Dict:
-        """Get latest prices with rate limiting."""
-        self._wait_for_rate_limit()
-        try:
-            result = self.client.get_latest()
-            self._handle_success()
-            return result
-        except Exception as e:
-            self._handle_error("429" in str(e) or "rate" in str(e).lower())
-            raise
-
-    def get_5m(self) -> Dict:
-        """Get 5m prices with rate limiting."""
-        self._wait_for_rate_limit()
-        try:
-            result = self.client.get_5m()
-            self._handle_success()
-            return result
-        except Exception as e:
-            self._handle_error("429" in str(e) or "rate" in str(e).lower())
-            raise
-
-    def get_1h(self) -> Dict:
-        """Get 1h prices with rate limiting."""
-        self._wait_for_rate_limit()
-        try:
-            result = self.client.get_1h()
-            self._handle_success()
-            return result
-        except Exception as e:
-            self._handle_error("429" in str(e) or "rate" in str(e).lower())
-            raise
-
-    def get_timeseries(self, item_id: int, timestep: str) -> List[Dict]:
-        """Get timeseries with rate limiting."""
-        self._wait_for_rate_limit()
-        try:
-            result = self.client.get_timeseries(item_id, timestep)
-            self._handle_success()
-            return result
-        except Exception as e:
-            self._handle_error("429" in str(e) or "rate" in str(e).lower())
-            raise
+    def get_stats(self) -> Dict:
+        """Get rate limiter statistics."""
+        with self.lock:
+            return {
+                "total_requests": self.total_requests,
+                "current_interval": self.current_interval,
+                "consecutive_errors": self.consecutive_errors,
+                "is_backing_off": time.time() < self.backoff_until
+            }
 
 
-class DataCollectorAggressive:
-    """Aggressive data collector with all safety features."""
+class ThreadSafeDB:
+    """Thread-safe SQLite database wrapper."""
 
-    def __init__(
-        self,
-        email: str,
-        db_path: str = "ge_prices.db",
-        checkpoint_path: str = "collection_checkpoint.json",
-        workers: int = 1
-    ):
-        self.email = email
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        self.checkpoint_path = checkpoint_path
-        self.workers = workers
-
-        # Initialize database
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.local = threading.local()
+        self.write_lock = threading.Lock()
         self._create_tables()
 
-        # Load or create checkpoint
-        self.checkpoint = Checkpoint.load(checkpoint_path)
-
-        # Statistics
-        self.stats = CollectionStats()
-
-        # Control flags
-        self.running = True
-        self.paused = False
-
-        # Register signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        # Create client pool for parallel requests
-        self.clients = [RateLimitedClient(email) for _ in range(workers)]
-
-        logger.info(f"Initialized collector with {workers} worker(s)")
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown gracefully."""
-        logger.info("Shutdown signal received, saving checkpoint...")
-        self.running = False
-        self.checkpoint.stats = {
-            "items_completed": self.stats.items_completed,
-            "timeseries_24h": self.stats.timeseries_24h_collected,
-            "timeseries_1h": self.stats.timeseries_1h_collected,
-            "errors": self.stats.errors
-        }
-        self.checkpoint.save(self.checkpoint_path)
-        logger.info("Checkpoint saved. Safe to exit.")
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get thread-local connection."""
+        if not hasattr(self.local, 'conn'):
+            self.local.conn = sqlite3.connect(self.db_path, timeout=30)
+        return self.local.conn
 
     def _create_tables(self):
         """Create database tables."""
-        cursor = self.conn.cursor()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS items (
@@ -371,353 +334,105 @@ class DataCollectorAggressive:
             )
         """)
 
-        # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_ts_item ON timeseries(item_id, timestep)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_5m_item ON prices_5m(item_id, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_1h_item ON prices_1h(item_id, timestamp)")
 
-        self.conn.commit()
+        conn.commit()
+        conn.close()
 
-    def _save_mapping(self, items: List[Dict]):
-        """Save item mapping."""
-        cursor = self.conn.cursor()
-        for item in items:
-            cursor.execute("""
-                INSERT OR REPLACE INTO items
-                (id, name, examine, members, lowalch, highalch, ge_limit, value, icon, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (
-                item.get("id"),
-                item.get("name"),
-                item.get("examine"),
-                1 if item.get("members") else 0,
-                item.get("lowalch"),
-                item.get("highalch"),
-                item.get("limit"),
-                item.get("value"),
-                item.get("icon")
-            ))
-        self.conn.commit()
+    def save_mapping(self, items: List[Dict]):
+        """Save item mapping (thread-safe)."""
+        with self.write_lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            for item in items:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO items
+                    (id, name, examine, members, lowalch, highalch, ge_limit, value, icon, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    item.get("id"),
+                    item.get("name"),
+                    item.get("examine"),
+                    1 if item.get("members") else 0,
+                    item.get("lowalch"),
+                    item.get("highalch"),
+                    item.get("limit"),
+                    item.get("value"),
+                    item.get("icon")
+                ))
+            conn.commit()
 
-    def _save_timeseries(self, item_id: int, timestep: str, data: List[Dict]) -> int:
-        """Save timeseries data. Returns number of new records."""
+    def save_timeseries(self, item_id: int, timestep: str, data: List[Dict]) -> int:
+        """Save timeseries data (thread-safe). Returns new record count."""
         if not data:
             return 0
 
-        cursor = self.conn.cursor()
-        new_records = 0
+        with self.write_lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            new_records = 0
 
-        for point in data:
-            try:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO timeseries
-                    (item_id, timestep, timestamp, avg_high_price, high_price_volume, avg_low_price, low_price_volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    item_id,
-                    timestep,
-                    point.get("timestamp"),
-                    point.get("avgHighPrice"),
-                    point.get("highPriceVolume"),
-                    point.get("avgLowPrice"),
-                    point.get("lowPriceVolume")
-                ))
-                if cursor.rowcount > 0:
-                    new_records += 1
-            except sqlite3.IntegrityError:
-                pass
-
-        self.conn.commit()
-        return new_records
-
-    def _save_bulk_prices(self, data: Dict, table: str, timestamp: int) -> int:
-        """Save bulk price data (5m or 1h)."""
-        cursor = self.conn.cursor()
-        new_records = 0
-
-        for item_id, prices in data.items():
-            if prices.get("avgHighPrice") is None and prices.get("avgLowPrice") is None:
-                continue
-
-            try:
-                cursor.execute(f"""
-                    INSERT OR IGNORE INTO {table}
-                    (item_id, timestamp, avg_high_price, high_price_volume, avg_low_price, low_price_volume)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    int(item_id),
-                    timestamp,
-                    prices.get("avgHighPrice"),
-                    prices.get("highPriceVolume"),
-                    prices.get("avgLowPrice"),
-                    prices.get("lowPriceVolume")
-                ))
-                if cursor.rowcount > 0:
-                    new_records += 1
-            except sqlite3.IntegrityError:
-                pass
-
-        self.conn.commit()
-        return new_records
-
-    def _collect_item_timeseries(self, client: RateLimitedClient, item_id: int) -> Tuple[int, int, Optional[str]]:
-        """Collect timeseries for a single item. Returns (records_24h, records_1h, error)."""
-        records_24h = 0
-        records_1h = 0
-        error = None
-
-        try:
-            # Get 24h timeseries (365 days of data)
-            data_24h = client.get_timeseries(item_id, "24h")
-            records_24h = self._save_timeseries(item_id, "24h", data_24h)
-
-            # Get 1h timeseries (365 hours = ~15 days)
-            data_1h = client.get_timeseries(item_id, "1h")
-            records_1h = self._save_timeseries(item_id, "1h", data_1h)
-
-        except Exception as e:
-            error = str(e)
-            logger.debug(f"Error collecting item {item_id}: {e}")
-
-        return records_24h, records_1h, error
-
-    def run(self, resume: bool = True):
-        """Run the collection process."""
-        if RICH_AVAILABLE:
-            self._run_with_rich()
-        else:
-            self._run_basic()
-
-    def _run_basic(self):
-        """Run with basic console output."""
-        client = self.clients[0]
-
-        # Phase 1: Get mapping
-        print("\n=== Phase 1: Fetching Item Mapping ===")
-        mapping = client.get_mapping()
-        self._save_mapping(mapping)
-        self.stats.items_total = len(mapping)
-        print(f"Loaded {len(mapping)} items")
-
-        # Get list of items to process
-        all_item_ids = [item["id"] for item in mapping]
-        pending_items = [i for i in all_item_ids if i not in self.checkpoint.completed_items]
-        print(f"Items to process: {len(pending_items)} ({len(self.checkpoint.completed_items)} already done)")
-
-        # Phase 1b: Backfill timeseries
-        print("\n=== Phase 1b: Backfilling Historical Data ===")
-        for i, item_id in enumerate(pending_items):
-            if not self.running:
-                break
-
-            records_24h, records_1h, error = self._collect_item_timeseries(client, item_id)
-
-            if error:
-                self.stats.errors += 1
-                if "429" in error or "rate" in error.lower():
-                    self.stats.rate_limits_hit += 1
-            else:
-                self.checkpoint.completed_items.add(item_id)
-                self.stats.items_completed += 1
-                self.stats.timeseries_24h_collected += records_24h
-                self.stats.timeseries_1h_collected += records_1h
-                self.stats.total_records += records_24h + records_1h
-
-            # Progress update
-            if (i + 1) % 50 == 0:
-                print(f"Progress: {i+1}/{len(pending_items)} | "
-                      f"Records: {self.stats.total_records:,} | "
-                      f"Errors: {self.stats.errors} | "
-                      f"Rate: {self.stats.rate():.1f}/min")
-                self.checkpoint.save(self.checkpoint_path)
-
-        # Phase 2: Continuous collection
-        print("\n=== Phase 2: Continuous Collection ===")
-        self.checkpoint.phase = "continuous"
-
-        while self.running:
-            now = time.time()
-
-            # Collect 1h data every hour
-            if now - self.checkpoint.last_hourly_collection >= 3600:
+            for point in data:
                 try:
-                    data = client.get_1h()
-                    timestamp = int(now // 3600) * 3600
-                    records = self._save_bulk_prices(data, "prices_1h", timestamp)
-                    self.stats.hourly_snapshots += 1
-                    self.stats.total_records += records
-                    self.checkpoint.last_hourly_collection = now
-                    print(f"[1h] Collected {records:,} records | Total: {self.stats.total_records:,}")
-                except Exception as e:
-                    logger.error(f"Error collecting 1h data: {e}")
-                    self.stats.errors += 1
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO timeseries
+                        (item_id, timestep, timestamp, avg_high_price, high_price_volume, avg_low_price, low_price_volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        item_id,
+                        timestep,
+                        point.get("timestamp"),
+                        point.get("avgHighPrice"),
+                        point.get("highPriceVolume"),
+                        point.get("avgLowPrice"),
+                        point.get("lowPriceVolume")
+                    ))
+                    if cursor.rowcount > 0:
+                        new_records += 1
+                except sqlite3.IntegrityError:
+                    pass
 
-            # Collect 5m data every 5 minutes
-            if now - self.checkpoint.last_5m_collection >= 300:
+            conn.commit()
+            return new_records
+
+    def save_bulk_prices(self, data: Dict, table: str, timestamp: int) -> int:
+        """Save bulk price data (thread-safe)."""
+        with self.write_lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            new_records = 0
+
+            for item_id, prices in data.items():
+                if prices.get("avgHighPrice") is None and prices.get("avgLowPrice") is None:
+                    continue
+
                 try:
-                    data = client.get_5m()
-                    timestamp = int(now // 300) * 300
-                    records = self._save_bulk_prices(data, "prices_5m", timestamp)
-                    self.stats.five_min_snapshots += 1
-                    self.stats.total_records += records
-                    self.checkpoint.last_5m_collection = now
-                    print(f"[5m] Collected {records:,} records | Total: {self.stats.total_records:,}")
-                except Exception as e:
-                    logger.error(f"Error collecting 5m data: {e}")
-                    self.stats.errors += 1
+                    cursor.execute(f"""
+                        INSERT OR IGNORE INTO {table}
+                        (item_id, timestamp, avg_high_price, high_price_volume, avg_low_price, low_price_volume)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        int(item_id),
+                        timestamp,
+                        prices.get("avgHighPrice"),
+                        prices.get("highPriceVolume"),
+                        prices.get("avgLowPrice"),
+                        prices.get("lowPriceVolume")
+                    ))
+                    if cursor.rowcount > 0:
+                        new_records += 1
+                except sqlite3.IntegrityError:
+                    pass
 
-            # Save checkpoint periodically
-            if now - self.stats.last_save >= 60:
-                self.checkpoint.save(self.checkpoint_path)
-                self.stats.last_save = now
+            conn.commit()
+            return new_records
 
-            # Sleep until next collection
-            time.sleep(10)
-
-    def _run_with_rich(self):
-        """Run with rich console output."""
-        console = Console()
-        client = self.clients[0]
-
-        console.print("\n[bold cyan]PPO Flipper Data Collection[/bold cyan]")
-        console.print("=" * 50)
-
-        # Phase 1: Get mapping
-        with console.status("[bold green]Fetching item mapping..."):
-            mapping = client.get_mapping()
-            self._save_mapping(mapping)
-            self.stats.items_total = len(mapping)
-
-        console.print(f"[green]✓[/green] Loaded {len(mapping):,} items")
-
-        # Get pending items
-        all_item_ids = [item["id"] for item in mapping]
-        pending_items = [i for i in all_item_ids if i not in self.checkpoint.completed_items]
-        console.print(f"[yellow]→[/yellow] Items to process: {len(pending_items):,} "
-                     f"({len(self.checkpoint.completed_items):,} already done)")
-
-        # Phase 1b: Backfill with progress bar
-        if pending_items:
-            console.print("\n[bold cyan]Phase 1: Historical Backfill[/bold cyan]")
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TextColumn("•"),
-                TimeElapsedColumn(),
-                TextColumn("•"),
-                TimeRemainingColumn(),
-                console=console
-            ) as progress:
-                task = progress.add_task(
-                    "[cyan]Collecting timeseries...",
-                    total=len(pending_items)
-                )
-
-                for item_id in pending_items:
-                    if not self.running:
-                        break
-
-                    records_24h, records_1h, error = self._collect_item_timeseries(client, item_id)
-
-                    if error:
-                        self.stats.errors += 1
-                        if "429" in error or "rate" in error.lower():
-                            self.stats.rate_limits_hit += 1
-                    else:
-                        self.checkpoint.completed_items.add(item_id)
-                        self.stats.items_completed += 1
-                        self.stats.timeseries_24h_collected += records_24h
-                        self.stats.timeseries_1h_collected += records_1h
-                        self.stats.total_records += records_24h + records_1h
-
-                    progress.update(task, advance=1)
-
-                    # Checkpoint every 100 items
-                    if self.stats.items_completed % 100 == 0:
-                        self.checkpoint.save(self.checkpoint_path)
-
-            # Final checkpoint after backfill
-            self.checkpoint.phase = "continuous"
-            self.checkpoint.save(self.checkpoint_path)
-
-            console.print(f"\n[green]✓[/green] Backfill complete!")
-            console.print(f"  • 24h records: {self.stats.timeseries_24h_collected:,}")
-            console.print(f"  • 1h records: {self.stats.timeseries_1h_collected:,}")
-            console.print(f"  • Errors: {self.stats.errors}")
-
-        # Phase 2: Continuous collection
-        console.print("\n[bold cyan]Phase 2: Continuous Collection[/bold cyan]")
-        console.print("[dim]Press Ctrl+C to stop gracefully[/dim]\n")
-
-        while self.running:
-            now = time.time()
-
-            # Collect 1h data
-            if now - self.checkpoint.last_hourly_collection >= 3600:
-                with console.status("[bold green]Collecting hourly data..."):
-                    try:
-                        data = client.get_1h()
-                        timestamp = int(now // 3600) * 3600
-                        records = self._save_bulk_prices(data, "prices_1h", timestamp)
-                        self.stats.hourly_snapshots += 1
-                        self.stats.total_records += records
-                        self.checkpoint.last_hourly_collection = now
-                        console.print(f"[green]✓[/green] [1h] {records:,} records | "
-                                     f"Total: {self.stats.total_records:,}")
-                    except Exception as e:
-                        console.print(f"[red]✗[/red] [1h] Error: {e}")
-                        self.stats.errors += 1
-
-            # Collect 5m data
-            if now - self.checkpoint.last_5m_collection >= 300:
-                with console.status("[bold green]Collecting 5-minute data..."):
-                    try:
-                        data = client.get_5m()
-                        timestamp = int(now // 300) * 300
-                        records = self._save_bulk_prices(data, "prices_5m", timestamp)
-                        self.stats.five_min_snapshots += 1
-                        self.stats.total_records += records
-                        self.checkpoint.last_5m_collection = now
-                        console.print(f"[green]✓[/green] [5m] {records:,} records | "
-                                     f"Total: {self.stats.total_records:,}")
-                    except Exception as e:
-                        console.print(f"[red]✗[/red] [5m] Error: {e}")
-                        self.stats.errors += 1
-
-            # Checkpoint
-            if now - self.stats.last_save >= 60:
-                self.checkpoint.save(self.checkpoint_path)
-                self.stats.last_save = now
-
-            # Calculate next collection time
-            next_5m = 300 - (now - self.checkpoint.last_5m_collection)
-            next_1h = 3600 - (now - self.checkpoint.last_hourly_collection)
-            wait_time = max(1, min(next_5m, next_1h, 30))
-
-            time.sleep(wait_time)
-
-        # Final stats
-        console.print("\n[bold cyan]Collection Summary[/bold cyan]")
-        table = Table()
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
-        table.add_row("Runtime", self.stats.elapsed())
-        table.add_row("Items Processed", f"{self.stats.items_completed:,}")
-        table.add_row("24h Timeseries", f"{self.stats.timeseries_24h_collected:,}")
-        table.add_row("1h Timeseries", f"{self.stats.timeseries_1h_collected:,}")
-        table.add_row("Hourly Snapshots", f"{self.stats.hourly_snapshots:,}")
-        table.add_row("5m Snapshots", f"{self.stats.five_min_snapshots:,}")
-        table.add_row("Total Records", f"{self.stats.total_records:,}")
-        table.add_row("Errors", f"{self.stats.errors}")
-        table.add_row("Rate Limits", f"{self.stats.rate_limits_hit}")
-        console.print(table)
-
-    def get_database_stats(self) -> Dict:
-        """Get current database statistics."""
-        cursor = self.conn.cursor()
+    def get_stats(self) -> Dict:
+        """Get database statistics."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         stats = {}
 
         cursor.execute("SELECT COUNT(*) FROM items")
@@ -735,99 +450,499 @@ class DataCollectorAggressive:
         cursor.execute("SELECT COUNT(*) FROM prices_5m")
         stats["prices_5m"] = cursor.fetchone()[0]
 
-        # Database file size
+        cursor.execute("SELECT COUNT(DISTINCT item_id) FROM timeseries")
+        stats["items_with_timeseries"] = cursor.fetchone()[0]
+
         stats["db_size_mb"] = os.path.getsize(self.db_path) / (1024 * 1024)
 
+        conn.close()
         return stats
 
-    def close(self):
-        """Close database connection."""
+
+class Worker:
+    """Worker thread for collecting data."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        email: str,
+        rate_limiter: GlobalRateLimiter,
+        db: ThreadSafeDB,
+        stats: CollectionStats
+    ):
+        self.worker_id = worker_id
+        self.email = email
+        self.rate_limiter = rate_limiter
+        self.db = db
+        self.stats = stats
+        self.client = GrandExchangeClient(contact_email=f"{email}")
+
+    def collect_item(self, item_id: int) -> Tuple[int, int, Optional[str]]:
+        """Collect timeseries for a single item."""
+        records_24h = 0
+        records_1h = 0
+        error = None
+
+        try:
+            # Get 24h timeseries
+            self.rate_limiter.wait()
+            data_24h = self.client.get_timeseries(item_id, "24h")
+            self.rate_limiter.report_success()
+            self.stats.increment(requests_made=1)
+            records_24h = self.db.save_timeseries(item_id, "24h", data_24h)
+
+            # Get 1h timeseries
+            self.rate_limiter.wait()
+            data_1h = self.client.get_timeseries(item_id, "1h")
+            self.rate_limiter.report_success()
+            self.stats.increment(requests_made=1)
+            records_1h = self.db.save_timeseries(item_id, "1h", data_1h)
+
+        except Exception as e:
+            error = str(e)
+            is_rate_limit = "429" in error or "rate" in error.lower()
+            self.rate_limiter.report_error(is_rate_limit)
+            if is_rate_limit:
+                self.stats.increment(rate_limits_hit=1)
+            logger.debug(f"Worker {self.worker_id}: Error on item {item_id}: {e}")
+
+        return records_24h, records_1h, error
+
+
+class MultithreadedCollector:
+    """Multithreaded data collector."""
+
+    def __init__(
+        self,
+        email: str,
+        db_path: str = "ge_prices.db",
+        checkpoint_path: str = "collection_checkpoint.json",
+        workers: int = 3,
+        requests_per_second: float = 10.0
+    ):
+        self.email = email
+        self.db_path = db_path
+        self.checkpoint_path = checkpoint_path
+        self.num_workers = workers
+
+        # Shared components
+        self.rate_limiter = GlobalRateLimiter(requests_per_second)
+        self.db = ThreadSafeDB(db_path)
+        self.checkpoint = Checkpoint.load(checkpoint_path)
+        self.stats = CollectionStats()
+
+        # Control
+        self.running = True
+        self.executor: Optional[ThreadPoolExecutor] = None
+
+        # Signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        logger.info(f"Initialized with {workers} workers, {requests_per_second} RPS limit")
+
+    def _signal_handler(self, signum, frame):
+        """Graceful shutdown."""
+        logger.info("Shutdown signal received...")
+        self.running = False
+        self._save_checkpoint()
+
+    def _save_checkpoint(self):
+        """Save current progress."""
+        self.checkpoint.stats = {
+            "items_completed": self.stats.items_completed,
+            "timeseries_24h": self.stats.timeseries_24h_collected,
+            "timeseries_1h": self.stats.timeseries_1h_collected,
+            "errors": self.stats.errors,
+            "requests": self.stats.requests_made
+        }
         self.checkpoint.save(self.checkpoint_path)
-        self.conn.close()
+
+    def _get_mapping(self) -> List[Dict]:
+        """Fetch and save item mapping."""
+        client = GrandExchangeClient(contact_email=self.email)
+        self.rate_limiter.wait()
+        mapping = client.get_mapping()
+        self.rate_limiter.report_success()
+        self.db.save_mapping(mapping)
+        return mapping
+
+    def run(self):
+        """Run collection."""
+        if RICH_AVAILABLE:
+            self._run_with_rich()
+        else:
+            self._run_basic()
+
+    def _run_basic(self):
+        """Run with basic console output."""
+        print("\n=== Multithreaded Data Collection ===")
+        print(f"Workers: {self.num_workers}")
+
+        # Get mapping
+        print("\nFetching item mapping...")
+        mapping = self._get_mapping()
+        self.stats.items_total = len(mapping)
+        print(f"Loaded {len(mapping)} items")
+
+        # Get pending items
+        all_item_ids = [item["id"] for item in mapping]
+        pending_items = [i for i in all_item_ids if i not in self.checkpoint.completed_items]
+        print(f"Pending: {len(pending_items)} items ({len(self.checkpoint.completed_items)} already done)")
+
+        if not pending_items:
+            print("All items already collected!")
+            self.checkpoint.phase = "continuous"
+        else:
+            # Create workers
+            workers = [
+                Worker(i, self.email, self.rate_limiter, self.db, self.stats)
+                for i in range(self.num_workers)
+            ]
+
+            # Process items with thread pool
+            print(f"\nStarting backfill with {self.num_workers} workers...")
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                self.executor = executor
+
+                # Submit all tasks
+                future_to_item = {
+                    executor.submit(workers[i % self.num_workers].collect_item, item_id): item_id
+                    for i, item_id in enumerate(pending_items)
+                }
+
+                completed = 0
+                for future in as_completed(future_to_item):
+                    if not self.running:
+                        break
+
+                    item_id = future_to_item[future]
+                    try:
+                        records_24h, records_1h, error = future.result()
+
+                        if error:
+                            self.stats.increment(errors=1)
+                        else:
+                            self.checkpoint.add_completed(item_id)
+                            self.stats.increment(
+                                items_completed=1,
+                                timeseries_24h_collected=records_24h,
+                                timeseries_1h_collected=records_1h,
+                                total_records=records_24h + records_1h
+                            )
+
+                        completed += 1
+                        if completed % 100 == 0:
+                            self._save_checkpoint()
+                            print(f"Progress: {completed}/{len(pending_items)} | "
+                                  f"Records: {self.stats.total_records:,} | "
+                                  f"Rate: {self.stats.requests_per_sec():.1f} req/s | "
+                                  f"Errors: {self.stats.errors}")
+
+                    except Exception as e:
+                        logger.error(f"Future error for item {item_id}: {e}")
+                        self.stats.increment(errors=1)
+
+            self.checkpoint.phase = "continuous"
+            self._save_checkpoint()
+            print(f"\nBackfill complete! {self.stats.items_completed} items, {self.stats.total_records:,} records")
+
+        # Phase 2: Continuous collection
+        print("\n=== Continuous Collection ===")
+        print("Press Ctrl+C to stop\n")
+
+        client = GrandExchangeClient(contact_email=self.email)
+
+        while self.running:
+            now = time.time()
+
+            # 1h collection
+            if now - self.checkpoint.last_hourly_collection >= 3600:
+                try:
+                    self.rate_limiter.wait()
+                    data = client.get_1h()
+                    self.rate_limiter.report_success()
+                    timestamp = int(now // 3600) * 3600
+                    records = self.db.save_bulk_prices(data, "prices_1h", timestamp)
+                    self.stats.increment(hourly_snapshots=1, total_records=records, requests_made=1)
+                    self.checkpoint.last_hourly_collection = now
+                    print(f"[1h] +{records:,} records | Total: {self.stats.total_records:,}")
+                except Exception as e:
+                    logger.error(f"1h collection error: {e}")
+                    self.stats.increment(errors=1)
+
+            # 5m collection
+            if now - self.checkpoint.last_5m_collection >= 300:
+                try:
+                    self.rate_limiter.wait()
+                    data = client.get_5m()
+                    self.rate_limiter.report_success()
+                    timestamp = int(now // 300) * 300
+                    records = self.db.save_bulk_prices(data, "prices_5m", timestamp)
+                    self.stats.increment(five_min_snapshots=1, total_records=records, requests_made=1)
+                    self.checkpoint.last_5m_collection = now
+                    print(f"[5m] +{records:,} records | Total: {self.stats.total_records:,}")
+                except Exception as e:
+                    logger.error(f"5m collection error: {e}")
+                    self.stats.increment(errors=1)
+
+            # Checkpoint
+            if now - self.stats.last_save >= 60:
+                self._save_checkpoint()
+                self.stats.last_save = now
+
+            time.sleep(10)
+
+        print("\nShutdown complete.")
+        self._print_summary()
+
+    def _run_with_rich(self):
+        """Run with rich console output."""
+        console = Console()
+
+        console.print("\n[bold cyan]Multithreaded Data Collection[/bold cyan]")
+        console.print(f"Workers: {self.num_workers} | RPS Limit: {self.rate_limiter.min_interval**-1:.1f}")
+        console.print("=" * 50)
+
+        # Get mapping
+        with console.status("[bold green]Fetching item mapping..."):
+            mapping = self._get_mapping()
+            self.stats.items_total = len(mapping)
+
+        console.print(f"[green]✓[/green] Loaded {len(mapping):,} items")
+
+        # Get pending
+        all_item_ids = [item["id"] for item in mapping]
+        pending_items = [i for i in all_item_ids if i not in self.checkpoint.completed_items]
+        console.print(f"[yellow]→[/yellow] Pending: {len(pending_items):,} ({len(self.checkpoint.completed_items):,} done)")
+
+        if pending_items:
+            console.print(f"\n[bold cyan]Phase 1: Backfill ({self.num_workers} workers)[/bold cyan]")
+
+            # Create workers
+            workers = [
+                Worker(i, self.email, self.rate_limiter, self.db, self.stats)
+                for i in range(self.num_workers)
+            ]
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TextColumn("[cyan]{task.fields[rps]:.1f} req/s"),
+                TextColumn("•"),
+                TextColumn("[green]{task.fields[records]:,} records"),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("→"),
+                TimeRemainingColumn(),
+                console=console,
+                refresh_per_second=2
+            ) as progress:
+                task = progress.add_task(
+                    "[cyan]Collecting...",
+                    total=len(pending_items),
+                    rps=0,
+                    records=0
+                )
+
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    self.executor = executor
+
+                    future_to_item = {
+                        executor.submit(workers[i % self.num_workers].collect_item, item_id): item_id
+                        for i, item_id in enumerate(pending_items)
+                    }
+
+                    for future in as_completed(future_to_item):
+                        if not self.running:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+
+                        item_id = future_to_item[future]
+                        try:
+                            records_24h, records_1h, error = future.result()
+
+                            if error:
+                                self.stats.increment(errors=1)
+                            else:
+                                self.checkpoint.add_completed(item_id)
+                                self.stats.increment(
+                                    items_completed=1,
+                                    timeseries_24h_collected=records_24h,
+                                    timeseries_1h_collected=records_1h,
+                                    total_records=records_24h + records_1h
+                                )
+
+                            progress.update(
+                                task,
+                                advance=1,
+                                rps=self.stats.requests_per_sec(),
+                                records=self.stats.total_records
+                            )
+
+                            # Checkpoint every 100 items
+                            if self.stats.items_completed % 100 == 0:
+                                self._save_checkpoint()
+
+                        except Exception as e:
+                            self.stats.increment(errors=1)
+
+            self.checkpoint.phase = "continuous"
+            self._save_checkpoint()
+
+            console.print(f"\n[green]✓[/green] Backfill complete!")
+            console.print(f"  • Items: {self.stats.items_completed:,}")
+            console.print(f"  • Records: {self.stats.total_records:,}")
+            console.print(f"  • Errors: {self.stats.errors}")
+            console.print(f"  • Avg speed: {self.stats.requests_per_sec():.1f} req/s")
+
+        # Phase 2
+        console.print(f"\n[bold cyan]Phase 2: Continuous Collection[/bold cyan]")
+        console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+        client = GrandExchangeClient(contact_email=self.email)
+
+        while self.running:
+            now = time.time()
+
+            if now - self.checkpoint.last_hourly_collection >= 3600:
+                with console.status("[green]Collecting 1h data..."):
+                    try:
+                        self.rate_limiter.wait()
+                        data = client.get_1h()
+                        self.rate_limiter.report_success()
+                        timestamp = int(now // 3600) * 3600
+                        records = self.db.save_bulk_prices(data, "prices_1h", timestamp)
+                        self.stats.increment(hourly_snapshots=1, total_records=records, requests_made=1)
+                        self.checkpoint.last_hourly_collection = now
+                        console.print(f"[green]✓[/green] [1h] +{records:,} records")
+                    except Exception as e:
+                        console.print(f"[red]✗[/red] [1h] Error: {e}")
+                        self.stats.increment(errors=1)
+
+            if now - self.checkpoint.last_5m_collection >= 300:
+                with console.status("[green]Collecting 5m data..."):
+                    try:
+                        self.rate_limiter.wait()
+                        data = client.get_5m()
+                        self.rate_limiter.report_success()
+                        timestamp = int(now // 300) * 300
+                        records = self.db.save_bulk_prices(data, "prices_5m", timestamp)
+                        self.stats.increment(five_min_snapshots=1, total_records=records, requests_made=1)
+                        self.checkpoint.last_5m_collection = now
+                        console.print(f"[green]✓[/green] [5m] +{records:,} records")
+                    except Exception as e:
+                        console.print(f"[red]✗[/red] [5m] Error: {e}")
+                        self.stats.increment(errors=1)
+
+            if now - self.stats.last_save >= 60:
+                self._save_checkpoint()
+                self.stats.last_save = now
+
+            time.sleep(10)
+
+        self._print_summary_rich(console)
+
+    def _print_summary(self):
+        """Print final summary."""
+        print("\n=== Collection Summary ===")
+        print(f"Runtime: {self.stats.elapsed()}")
+        print(f"Items: {self.stats.items_completed:,}")
+        print(f"24h timeseries: {self.stats.timeseries_24h_collected:,}")
+        print(f"1h timeseries: {self.stats.timeseries_1h_collected:,}")
+        print(f"Total records: {self.stats.total_records:,}")
+        print(f"Requests: {self.stats.requests_made:,}")
+        print(f"Avg speed: {self.stats.requests_per_sec():.2f} req/s")
+        print(f"Errors: {self.stats.errors}")
+        print(f"Rate limits: {self.stats.rate_limits_hit}")
+
+        db_stats = self.db.get_stats()
+        print(f"Database size: {db_stats['db_size_mb']:.1f} MB")
+
+    def _print_summary_rich(self, console):
+        """Print rich summary."""
+        table = Table(title="Collection Summary")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Runtime", self.stats.elapsed())
+        table.add_row("Items Processed", f"{self.stats.items_completed:,}")
+        table.add_row("24h Timeseries", f"{self.stats.timeseries_24h_collected:,}")
+        table.add_row("1h Timeseries", f"{self.stats.timeseries_1h_collected:,}")
+        table.add_row("Total Records", f"{self.stats.total_records:,}")
+        table.add_row("Requests Made", f"{self.stats.requests_made:,}")
+        table.add_row("Avg Speed", f"{self.stats.requests_per_sec():.2f} req/s")
+        table.add_row("Errors", f"{self.stats.errors}")
+        table.add_row("Rate Limits Hit", f"{self.stats.rate_limits_hit}")
+
+        db_stats = self.db.get_stats()
+        table.add_row("Database Size", f"{db_stats['db_size_mb']:.1f} MB")
+
+        console.print(table)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Aggressive OSRS GE Data Collection",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Multithreaded OSRS GE Data Collection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Standard collection (3 workers)
+    python data/collect_all.py --email your@email.com
+
+    # Fast collection (5 workers, 15 RPS)
+    python data/collect_all.py --email your@email.com --workers 5 --rps 15
+
+    # Conservative (2 workers, 5 RPS)
+    python data/collect_all.py --email your@email.com --workers 2 --rps 5
+
+    # Check database stats
+    python data/collect_all.py --email your@email.com --stats
+        """
     )
 
-    parser.add_argument(
-        "--email", "-e",
-        required=True,
-        help="Contact email (REQUIRED by API)"
-    )
-
-    parser.add_argument(
-        "--db", "-d",
-        default="ge_prices.db",
-        help="Database path (default: ge_prices.db)"
-    )
-
-    parser.add_argument(
-        "--checkpoint", "-c",
-        default="collection_checkpoint.json",
-        help="Checkpoint file path"
-    )
-
-    parser.add_argument(
-        "--resume", "-r",
-        action="store_true",
-        help="Resume from checkpoint (default behavior)"
-    )
-
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Start fresh, ignore checkpoint"
-    )
-
-    parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=1,
-        help="Number of parallel workers (default: 1, be careful with rate limits)"
-    )
-
-    parser.add_argument(
-        "--stats",
-        action="store_true",
-        help="Show database stats and exit"
-    )
+    parser.add_argument("--email", "-e", required=True, help="Contact email (REQUIRED)")
+    parser.add_argument("--db", "-d", default="ge_prices.db", help="Database path")
+    parser.add_argument("--checkpoint", "-c", default="collection_checkpoint.json", help="Checkpoint path")
+    parser.add_argument("--workers", "-w", type=int, default=3, help="Number of workers (default: 3)")
+    parser.add_argument("--rps", type=float, default=10.0, help="Max requests per second (default: 10)")
+    parser.add_argument("--fresh", action="store_true", help="Start fresh, ignore checkpoint")
+    parser.add_argument("--stats", action="store_true", help="Show stats and exit")
 
     args = parser.parse_args()
 
-    # Handle fresh start
     if args.fresh and os.path.exists(args.checkpoint):
         os.remove(args.checkpoint)
-        print("Removed checkpoint, starting fresh")
+        print("Checkpoint removed, starting fresh")
 
-    # Initialize collector
-    collector = DataCollectorAggressive(
+    collector = MultithreadedCollector(
         email=args.email,
         db_path=args.db,
         checkpoint_path=args.checkpoint,
-        workers=args.workers
+        workers=args.workers,
+        requests_per_second=args.rps
     )
 
+    if args.stats:
+        stats = collector.db.get_stats()
+        print("\n=== Database Statistics ===")
+        for k, v in stats.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.2f}")
+            else:
+                print(f"  {k}: {v:,}")
+        return
+
     try:
-        if args.stats:
-            stats = collector.get_database_stats()
-            print("\n=== Database Statistics ===")
-            for key, value in stats.items():
-                if isinstance(value, float):
-                    print(f"  {key}: {value:.2f}")
-                else:
-                    print(f"  {key}: {value:,}")
-            return
-
         collector.run()
-
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted")
     finally:
-        collector.close()
-        print("Collector closed, checkpoint saved.")
+        collector._save_checkpoint()
+        print("Checkpoint saved.")
 
 
 if __name__ == "__main__":
