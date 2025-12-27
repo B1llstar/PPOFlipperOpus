@@ -4,7 +4,7 @@ import logging
 import json
 import os
 from typing import Dict, List, Tuple, Optional, Any
-from volume_analysis import VolumeAnalyzer
+from training.volume_analysis import VolumeAnalyzer
 
 # Set up module-level logger
 logger = logging.getLogger("shared_knowledge")

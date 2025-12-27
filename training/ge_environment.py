@@ -185,8 +185,7 @@ class GrandExchangeEnv(gym.Env):
         # Get items with most trading data (top by volume)
         cursor.execute("""
             SELECT item_id, SUM(high_price_volume + low_price_volume) as total_vol
-            FROM timeseries
-            WHERE timestep = '1h'
+            FROM backfill_5m
             GROUP BY item_id
             ORDER BY total_vol DESC
             LIMIT ?
@@ -198,18 +197,18 @@ class GrandExchangeEnv(gym.Env):
 
         if not self.tradeable_items:
             print("[DEBUG] ERROR: No tradeable items found! Checking database...")
-            cursor.execute("SELECT COUNT(*) FROM timeseries WHERE timestep = '1h'")
-            print(f"[DEBUG] Total 1h timeseries rows: {cursor.fetchone()[0]}")
-            cursor.execute("SELECT DISTINCT timestep FROM timeseries")
-            print(f"[DEBUG] Available timesteps: {cursor.fetchall()}")
+            cursor.execute("SELECT COUNT(*) FROM backfill_5m")
+            print(f"[DEBUG] Total backfill_5m rows: {cursor.fetchone()[0]}")
+            cursor.execute("SELECT COUNT(DISTINCT item_id) FROM backfill_5m")
+            print(f"[DEBUG] Available items: {cursor.fetchone()[0]}")
 
-        # Load all timeseries data for these items
+        # Load all market data for these items
         placeholders = ",".join("?" * len(self.tradeable_items)) if self.tradeable_items else "0"
         cursor.execute(f"""
             SELECT item_id, timestamp, avg_high_price, high_price_volume,
                    avg_low_price, low_price_volume
-            FROM timeseries
-            WHERE timestep = '1h' AND item_id IN ({placeholders})
+            FROM backfill_5m
+            WHERE item_id IN ({placeholders})
             ORDER BY timestamp
         """, self.tradeable_items)
 
@@ -232,8 +231,7 @@ class GrandExchangeEnv(gym.Env):
 
         # Get unique timestamps for episode sampling
         cursor.execute("""
-            SELECT DISTINCT timestamp FROM timeseries
-            WHERE timestep = '1h'
+            SELECT DISTINCT timestamp FROM backfill_5m
             ORDER BY timestamp
         """)
         self.all_timestamps = [row[0] for row in cursor.fetchall()]

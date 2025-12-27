@@ -26,6 +26,7 @@ import uvicorn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from ppo_config import ENV_KWARGS, PPO_KWARGS, TRAIN_KWARGS
+from training.training_controller import TrainingController as RealTrainingController
 
 
 class TrainingState(str, Enum):
@@ -108,6 +109,15 @@ class TrainingManager:
         self.lock = threading.Lock()
 
         self.start_time: Optional[datetime] = None
+        
+        # Real training controller
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        db_path = os.path.join(project_root, 'ge_prices.db')
+        self.training_controller = RealTrainingController(
+            db_path=db_path,
+            callback=self._training_callback
+        )
 
     def get_state_dict(self) -> Dict:
         """Get complete state as dictionary."""
@@ -214,6 +224,39 @@ class TrainingManager:
         for conn in disconnected:
             self.connections.remove(conn)
 
+    def _training_callback(self, agent_id: int, data: Dict):
+        """Callback from training controller."""
+        with self.lock:
+            update_type = data.get('type')
+            update_data = data.get('data', {})
+            
+            if update_type == 'step':
+                # Update agent metrics
+                self.update_agent(
+                    agent_id,
+                    cash=update_data.get('cash', 0),
+                    portfolio_value=update_data.get('portfolio_value', 0),
+                    episode_reward=update_data.get('episode_reward', 0),
+                    step=update_data.get('step', 0),
+                    episode=update_data.get('episode', 0),
+                )
+                
+                # Update training metrics
+                self.metrics.total_steps = update_data.get('step', 0)
+                self.metrics.total_episodes = update_data.get('episode', 0)
+                
+            elif update_type == 'episode_complete':
+                # Log reward point
+                self.add_reward_point(
+                    update_data.get('episode', 0),
+                    update_data.get('total_reward', 0),
+                    agent_id
+                )
+                
+                # Update best reward
+                if update_data.get('total_reward', 0) > self.metrics.best_reward:
+                    self.metrics.best_reward = update_data.get('total_reward', 0)
+    
     def start_training(self):
         """Start training."""
         if self.state != TrainingState.IDLE:
@@ -223,8 +266,6 @@ class TrainingManager:
         self.metrics.state = TrainingState.RUNNING
         self.start_time = datetime.now()
         self.metrics.start_time = self.start_time.isoformat()
-        self.stop_event.clear()
-        self.pause_event.set()
 
         # Reset agents
         for agent in self.agents.values():
@@ -239,11 +280,8 @@ class TrainingManager:
             agent.profitable_trades = 0
             agent.taxes_paid = 0.0
 
-        # Start training thread
-        self.training_thread = threading.Thread(target=self._training_loop, daemon=True)
-        self.training_thread.start()
-
-        return True
+        # Start real training via controller
+        return self.training_controller.start()
 
     def stop_training(self):
         """Stop training."""
@@ -252,217 +290,75 @@ class TrainingManager:
 
         self.state = TrainingState.STOPPING
         self.metrics.state = TrainingState.STOPPING
-        self.stop_event.set()
-        self.pause_event.set()  # Unpause to allow thread to exit
 
-        return True
+        # Stop real training via controller
+        result = self.training_controller.stop()
+        
+        if result:
+            self.state = TrainingState.IDLE
+            self.metrics.state = TrainingState.IDLE
+        
+        return result
 
     def pause_training(self):
         """Pause training."""
         if self.state != TrainingState.RUNNING:
             return False
 
-        self.state = TrainingState.PAUSED
-        self.metrics.state = TrainingState.PAUSED
-        self.pause_event.clear()
+        # Pause real training via controller
+        result = self.training_controller.pause()
+        
+        if result:
+            self.state = TrainingState.PAUSED
+            self.metrics.state = TrainingState.PAUSED
 
-        return True
+        return result
 
     def resume_training(self):
         """Resume training."""
         if self.state != TrainingState.PAUSED:
             return False
 
-        self.state = TrainingState.RUNNING
-        self.metrics.state = TrainingState.RUNNING
-        self.pause_event.set()
+        # Resume real training via controller
+        result = self.training_controller.resume()
+        
+        if result:
+            self.state = TrainingState.RUNNING
+            self.metrics.state = TrainingState.RUNNING
 
-        return True
+        return result
 
-    def _training_loop(self):
-        """Main training loop (runs in separate thread)."""
-        try:
-            # Import training components
-            from training.ge_environment import GrandExchangeEnv
-            from ppo_agent import PPOAgent
-            from ppo_config import ENV_KWARGS, PPO_KWARGS
-
-            import torch
-            import numpy as np
-
-            device = PPO_KWARGS.get('device', 'cpu')
-            print(f"Using device: {device}")
-
-            # Create environments and agents for each agent
-            envs = []
-            agents = []
-
-            # Database path - relative to this file's location
-            # server.py is in dashboard/backend/, so go up 2 levels to project root
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(script_dir))
-            db_path = os.path.join(project_root, 'ge_prices.db')
-            print(f"Database path: {db_path}")
-            print(f"Database exists: {os.path.exists(db_path)}")
-
-            if not os.path.exists(db_path):
-                raise FileNotFoundError(f"Database not found at {db_path}")
-
-            for i in range(self.num_agents):
-                print(f"Creating environment {i+1}/{self.num_agents}...")
-                env = GrandExchangeEnv(
-                    db_path=db_path,
-                    initial_cash=ENV_KWARGS.get('starting_gp', 10_000_000),
-                    episode_length=ENV_KWARGS.get('max_steps', 168),
-                    top_n_items=50,
-                )
-                print(f"Environment {i+1} created. Tradeable items: {len(env.tradeable_items)}")
-                envs.append(env)
-
-                # Build item_list, price_ranges, buy_limits from environment
-                item_list = [f"Item_{item_id}" for item_id in env.tradeable_items]
-                price_ranges = {}
-                buy_limits = {}
-                for item_id in env.tradeable_items:
-                    meta = env.item_metadata.get(item_id, {})
-                    # Get price range from market history
-                    history = env.market_history.get(item_id, [])
-                    if history:
-                        min_price = min(s.low_price for s in history)
-                        max_price = max(s.high_price for s in history)
-                    else:
-                        min_price, max_price = 1, 1000000
-                    price_ranges[f"Item_{item_id}"] = (min_price, max_price)
-                    buy_limits[f"Item_{item_id}"] = meta.get('ge_limit', 10000)
-
-                agent = PPOAgent(
-                    item_list=item_list,
-                    price_ranges=price_ranges,
-                    buy_limits=buy_limits,
-                    device=torch.device(device),
-                    hidden_size=PPO_KWARGS.get('hidden_size', 256),
-                    num_layers=PPO_KWARGS.get('num_layers', 3),
-                    price_bins=PPO_KWARGS.get('price_bins', 21),
-                    quantity_bins=PPO_KWARGS.get('quantity_bins', 11),
-                    lr=PPO_KWARGS.get('lr', 3e-4),
-                    gamma=PPO_KWARGS.get('gamma', 0.99),
-                    gae_lambda=PPO_KWARGS.get('gae_lambda', 0.95),
-                    clip_epsilon=PPO_KWARGS.get('clip_epsilon', 0.2),
-                    entropy_coef=PPO_KWARGS.get('entropy_coef', 0.01),
-                    value_coef=PPO_KWARGS.get('value_coef', 0.5),
-                    max_grad_norm=PPO_KWARGS.get('max_grad_norm', 0.5),
-                    agent_id=i,
-                )
-                agents.append(agent)
-                print(f"Agent {i+1} created with {len(item_list)} items")
-
-            # Initialize observations
-            observations = [env.reset()[0] for env in envs]
-            episode_rewards = [0.0] * self.num_agents
-            episode_steps = [0] * self.num_agents
-
-            step = 0
-            episode = 0
-
-            while not self.stop_event.is_set():
-                # Check for pause
-                self.pause_event.wait()
-
-                if self.stop_event.is_set():
-                    break
-
-                # Run one step for each agent
-                for i, (env, agent, obs) in enumerate(zip(envs, agents, observations)):
-                    # Get action from policy - sample from action space for now
-                    # The environment expects actions of shape (n_items, 3)
-                    action = env.action_space.sample()
-
-                    next_obs, reward, terminated, truncated, info = env.step(action)
-                    done = terminated or truncated
-
-                    episode_rewards[i] += reward
-                    episode_steps[i] += 1
-
-                    # Get holdings from positions
-                    holdings = {}
-                    for item_id, position in env.positions.items():
-                        if position.quantity > 0:
-                            holdings[f"Item_{item_id}"] = position.quantity
-
-                    # Update agent metrics
-                    self.update_agent(
-                        i,
-                        cash=env.cash,
-                        portfolio_value=info.get('total_value', env.cash) - env.cash,
-                        holdings=holdings,
-                        pending_orders=[],
-                        step=episode_steps[i],
-                        episode=episode,
-                        current_action=f"step {episode_steps[i]}",
-                    )
-
-                    # Track trades from info
-                    if info.get('total_trades', 0) > self.agents[i].trades_executed:
-                        new_trades = info['total_trades'] - self.agents[i].trades_executed
-                        self.update_agent(i, trades_executed=info['total_trades'])
-
-                        # Estimate profitable trades from win rate
-                        win_rate = info.get('win_rate', 0)
-                        profitable = int(info['total_trades'] * win_rate)
-                        self.update_agent(i, profitable_trades=profitable)
-
-                    if done:
-                        # Episode complete for this agent
-                        self.update_agent(
-                            i,
-                            episode_reward=episode_rewards[i],
-                            total_reward=self.agents[i].total_reward + episode_rewards[i],
-                        )
-                        self.add_reward_point(episode, episode_rewards[i], i)
-
-                        # Reset
-                        observations[i] = env.reset()[0]
-                        episode_rewards[i] = 0.0
-                        episode_steps[i] = 0
-                    else:
-                        observations[i] = next_obs
-
-                step += 1
-
-                # Update training metrics periodically
-                if step % 100 == 0:
-                    portfolio_values = {
-                        i: self.agents[i].total_assets
-                        for i in range(self.num_agents)
-                    }
-                    self.add_portfolio_point(episode, portfolio_values)
-
-                    avg_reward = np.mean([a.episode_reward for a in self.agents.values()])
-                    best_reward = max(self.metrics.best_reward, max(a.total_reward for a in self.agents.values()))
-
-                    self.update_training(
-                        total_steps=step,
-                        total_episodes=episode,
-                        avg_reward=avg_reward,
-                        best_reward=best_reward,
-                        learning_rate=PPO_KWARGS.get('lr', 3e-4),
-                    )
-
-                # Check if all agents completed an episode
-                if all(s == 0 for s in episode_steps):
-                    episode += 1
-
-                # Small delay to prevent CPU spinning
-                time.sleep(0.01)
-
-        except Exception as e:
-            print(f"Training error: {e}")
-            import traceback
-            traceback.print_exc()
-
-        finally:
-            self.state = TrainingState.IDLE
-            self.metrics.state = TrainingState.IDLE
+    def _update_from_controller(self):
+        """Update metrics from training controller (called periodically)."""
+        with self.lock:
+            # Get state from controller
+            self.state = TrainingState(self.training_controller.get_state())
+            self.metrics.state = self.state
+            
+            # Update elapsed time
+            if self.start_time and self.state == TrainingState.RUNNING:
+                self.metrics.elapsed_seconds = (datetime.now() - self.start_time).total_seconds()
+            
+            # Get stats from all agents
+            all_stats = self.training_controller.get_all_stats()
+            
+            for agent_id, stats in all_stats.items():
+                if agent_id in self.agents:
+                    self.metrics.total_steps = max(self.metrics.total_steps, stats.get('total_steps', 0))
+                    self.metrics.total_episodes = max(self.metrics.total_episodes, stats.get('episode', 0))
+                    
+                    avg_reward = stats.get('avg_reward', 0)
+                    if avg_reward != 0:
+                        self.metrics.avg_reward = avg_reward
+                    
+                    best = stats.get('best_reward', float('-inf'))
+                    if best > self.metrics.best_reward:
+                        self.metrics.best_reward = best
+                    
+                    self.metrics.policy_loss = stats.get('policy_loss', 0)
+                    self.metrics.value_loss = stats.get('value_loss', 0)
+                    self.metrics.entropy = stats.get('entropy', 0)
+                    self.metrics.learning_rate = stats.get('learning_rate', 0)
 
     def _load_items(self) -> Dict:
         """Load items for training."""
@@ -539,6 +435,35 @@ async def root():
     return {"status": "ok", "message": "PPO Flipper Dashboard API"}
 
 
+@app.get("/api/health")
+async def health_check():
+    """Detailed health check including database status."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(script_dir))
+    db_path = os.path.join(project_root, 'ge_prices.db')
+    
+    db_exists = os.path.exists(db_path)
+    db_size = os.path.getsize(db_path) if db_exists else 0
+    
+    health = {
+        "status": "healthy" if db_exists else "unhealthy",
+        "database": {
+            "path": db_path,
+            "exists": db_exists,
+            "size_mb": round(db_size / (1024 * 1024), 2) if db_exists else 0,
+        },
+        "training": {
+            "state": manager.state.value,
+            "num_agents": manager.num_agents,
+        },
+        "connections": {
+            "websockets": len(manager.connections),
+        }
+    }
+    
+    return health
+
+
 @app.get("/api/state")
 async def get_state():
     """Get complete training state."""
@@ -602,6 +527,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # Keep connection alive and send updates
         while True:
+            # Update from training controller
+            manager._update_from_controller()
+            
             # Send state updates every 500ms
             await asyncio.sleep(0.5)
             await websocket.send_json({
