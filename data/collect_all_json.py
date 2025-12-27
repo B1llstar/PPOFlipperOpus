@@ -413,11 +413,8 @@ def main():
                     count = data_store.save_5m_prices(prices_5m_hist, timestamp=timestamp)
                     collected_5m += count
                     
-                    # Progress update and save every 100 requests
+                    # Progress update every 100 requests
                     if (idx + 1) % 100 == 0:
-                        # Flush data to disk
-                        data_store._write_5m_prices()
-                        
                         progress = (idx + 1) / total_requests * 100
                         if console:
                             console.print(f"Progress: {idx + 1}/{total_requests} ({progress:.1f}%) | Collected: {collected_5m:,} records")
