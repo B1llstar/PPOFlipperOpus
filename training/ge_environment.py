@@ -132,7 +132,8 @@ class GrandExchangeEnv(gym.Env):
 
     def __init__(
         self,
-        db_path: str,
+        db_path: Optional[str] = None,
+        cache_file: Optional[str] = None,
         initial_cash: float = 10_000_000,  # 10M GP starting capital
         episode_length: int = 168,  # Number of steps per episode
         top_n_items: int = 50,  # Number of items to trade
@@ -145,6 +146,7 @@ class GrandExchangeEnv(gym.Env):
         super().__init__()
 
         self.db_path = db_path
+        self.cache_file = cache_file
         self.initial_cash = initial_cash
         self.episode_length = episode_length
         self.top_n_items = top_n_items
@@ -153,7 +155,7 @@ class GrandExchangeEnv(gym.Env):
         self.render_mode = render_mode
         self.timestep = timestep  # "24h" or "1h"
 
-        # Load market data
+        # Load market data (from cache if available, else database)
         self._load_market_data()
 
         # Define spaces
@@ -165,8 +167,60 @@ class GrandExchangeEnv(gym.Env):
         logger.info(f"GE Environment initialized with {len(self.tradeable_items)} items")
 
     def _load_market_data(self):
-        """Load historical market data from database."""
-        print(f"[DEBUG] Loading market data from: {self.db_path}")
+        """Load historical market data from cache or database."""
+        # Try to load from cache first (much faster)
+        if self.cache_file:
+            try:
+                from training.cached_market_loader import get_cache, load_cache
+                
+                print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
+                load_cache(self.cache_file)
+                cache = get_cache()
+                
+                # Get top N items from cache
+                min_data_points = self.episode_length + self.LOOKBACK_PERIODS
+                available_items = cache.get_tradeable_items(min_data_points)
+                self.tradeable_items = available_items[:self.top_n_items]
+                
+                # Load metadata
+                self.item_metadata = {
+                    item_id: cache.get_item_metadata(item_id)
+                    for item_id in self.tradeable_items
+                }
+                
+                # Load market history (convert back to MarketState)
+                self.market_history: Dict[int, List[MarketState]] = {}
+                for item_id in self.tradeable_items:
+                    cached_history = cache.get_market_history(item_id)
+                    self.market_history[item_id] = [
+                        MarketState(
+                            item_id=state.item_id,
+                            high_price=state.high_price,
+                            low_price=state.low_price,
+                            high_volume=state.high_volume,
+                            low_volume=state.low_volume,
+                            timestamp=state.timestamp
+                        )
+                        for state in cached_history
+                    ]
+                
+                self.all_timestamps = cache.timestamps.copy()
+                self.item_to_idx = {item_id: idx for idx, item_id in enumerate(self.tradeable_items)}
+                
+                print(f"[DEBUG] ✓ Loaded {len(self.tradeable_items)} items from cache")
+                logger.info(f"Loaded {len(self.tradeable_items)} items from cache")
+                logger.info(f"Timeline: {len(self.all_timestamps)} data points")
+                return
+                
+            except Exception as e:
+                print(f"[DEBUG] Cache loading failed: {e}")
+                logger.warning(f"Failed to load from cache: {e}, falling back to database")
+        
+        # Fallback to database loading
+        if not self.db_path:
+            raise ValueError("Must provide either cache_file or db_path")
+            
+        print(f"[DEBUG] Loading market data from database: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
