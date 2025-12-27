@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-JSON-based Data Collection Script
+MongoDB Data Collection Script
 
-Collects GE price data and stores it as JSON files ready for MongoDB import.
-This is a drop-in replacement for collect_all.py but saves to JSON instead of SQLite.
+Collects GE price data and stores it directly in MongoDB for optimal performance.
+Eliminates file I/O bottlenecks by writing directly to database.
 
 Usage:
     python data/collect_all_json.py --email your@email.com
@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Set, Tuple
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.ge_rest_client import GrandExchangeClient, GrandExchangeAPIError, RateLimitError
-from data.json_data_store import JSONDataStore
+from data.mongo_data_store import MongoDataStore
 
 # Rich console for pretty output (fallback to basic if not installed)
 try:
@@ -260,7 +260,11 @@ def main():
 
     # Initialize components
     client = GrandExchangeClient(contact_email=args.email)
-    data_store = JSONDataStore(output_dir=args.output_dir)
+    data_store = MongoDataStore(
+        connection_string="mongodb://localhost:27017/",
+        database="ppoflipper",
+        collection="GEData"
+    )
     stats = CollectionStats()
     rate_limiter = RateLimiter(requests_per_second=args.rps)
     checkpoint_mgr = CheckpointManager()
