@@ -208,7 +208,7 @@ def collect_item_data(
         # Collect 24h timeseries (most comprehensive)
         rate_limiter.wait()
         try:
-            timeseries_24h = client.get_item_timeseries(item_id, "24h")
+            timeseries_24h = client.get_timeseries(item_id, "24h")
             if timeseries_24h:
                 count = data_store.save_timeseries(item_id, "24h", timeseries_24h)
                 stats.increment(timeseries_24h_collected=count, requests_made=1, total_records=count)
@@ -222,7 +222,7 @@ def collect_item_data(
         # Collect 1h timeseries
         rate_limiter.wait()
         try:
-            timeseries_1h = client.get_item_timeseries(item_id, "1h")
+            timeseries_1h = client.get_timeseries(item_id, "1h")
             if timeseries_1h:
                 count = data_store.save_timeseries(item_id, "1h", timeseries_1h)
                 stats.increment(timeseries_1h_collected=count, requests_made=1, total_records=count)
@@ -252,10 +252,14 @@ def main():
     parser.add_argument("--rps", type=float, default=10.0, help="Requests per second limit (default: 10)")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--output-dir", default="mongo_data", help="Output directory for JSON files")
+    parser.add_argument("--backfill-5m-days", type=int, default=0, help="Backfill 5m data for N days (recommended: 30 for training)")
+    parser.add_argument("--backfill-5m-items", type=int, nargs='+', help="Specific item IDs to backfill 5m data for")
+    parser.add_argument("--backfill-5m-top-items", type=int, help="Auto-select top N most traded items for 5m backfill")
+    parser.add_argument("--skip-timeseries", action="store_true", help="Skip 24h/1h timeseries collection (for 5m-only runs)")
     args = parser.parse_args()
 
     # Initialize components
-    client = GrandExchangeClient(user_agent_email=args.email)
+    client = GrandExchangeClient(contact_email=args.email)
     data_store = JSONDataStore(output_dir=args.output_dir)
     stats = CollectionStats()
     rate_limiter = RateLimiter(requests_per_second=args.rps)
@@ -294,7 +298,7 @@ def main():
             print("Collecting latest prices...")
 
         rate_limiter.wait()
-        latest = client.get_latest_prices()
+        latest = client.get_latest()
         data_store.save_latest_prices(latest)
         logger.info(f"Collected latest prices for {len(latest)} items")
 
@@ -305,7 +309,7 @@ def main():
             print("Collecting 5-minute prices...")
 
         rate_limiter.wait()
-        prices_5m = client.get_5m_prices()
+        prices_5m = client.get_5m()
         count = data_store.save_5m_prices(prices_5m)
         stats.increment(five_min_snapshots=count)
         logger.info(f"Collected 5m prices for {count} items")
@@ -317,10 +321,114 @@ def main():
             print("Collecting 1-hour prices...")
 
         rate_limiter.wait()
-        prices_1h = client.get_1h_prices()
+        prices_1h = client.get_1h()
         count = data_store.save_1h_prices(prices_1h)
         stats.increment(hourly_snapshots=count)
         logger.info(f"Collected 1h prices for {count} items")
+
+        # Step 4.5: Backfill 5m historical data if requested
+        if args.backfill_5m_days > 0:
+            if console:
+                console.print(f"[bold cyan]Backfilling {args.backfill_5m_days} days of 5-minute data...[/bold cyan]")
+            else:
+                print(f"Backfilling {args.backfill_5m_days} days of 5-minute data...")
+            
+            # Determine which items to collect
+            target_items = []
+            if args.backfill_5m_items:
+                target_items = args.backfill_5m_items
+                if console:
+                    console.print(f"[yellow]Collecting for {len(target_items)} specified items[/yellow]")
+                else:
+                    print(f"Collecting for {len(target_items)} specified items")
+            elif args.backfill_5m_top_items:
+                # Get top items by volume from latest 1h prices
+                if console:
+                    console.print(f"[yellow]Auto-selecting top {args.backfill_5m_top_items} most traded items...[/yellow]")
+                else:
+                    print(f"Auto-selecting top {args.backfill_5m_top_items} most traded items...")
+                
+                # Calculate volumes
+                item_volumes = {}
+                for item_id_str, price_data in prices_1h.items():
+                    item_id = int(item_id_str)
+                    volume = (price_data.get('highPriceVolume') or 0) + (price_data.get('lowPriceVolume') or 0)
+                    item_volumes[item_id] = volume
+                
+                # Sort by volume and take top N
+                sorted_items = sorted(item_volumes.items(), key=lambda x: x[1], reverse=True)
+                target_items = [item_id for item_id, vol in sorted_items[:args.backfill_5m_top_items]]
+                
+                if console:
+                    console.print(f"[green]Selected {len(target_items)} top items[/green]")
+                else:
+                    print(f"Selected {len(target_items)} top items")
+            
+            # Calculate timestamps (every 5 minutes, going back N days)
+            now = int(time.time())
+            current_5m = (now // 300) * 300  # Round to nearest 5min
+            seconds_back = args.backfill_5m_days * 86400
+            timestamps = []
+            
+            for i in range(0, seconds_back, 300):  # Every 5 minutes
+                timestamps.append(current_5m - i)
+            
+            timestamps.reverse()  # Oldest first
+            
+            total_requests = len(timestamps)
+            if target_items:
+                estimated_records = total_requests * len(target_items)
+                if console:
+                    console.print(f"[yellow]Will make {total_requests} requests for {len(target_items)} items[/yellow]")
+                    console.print(f"[yellow]Estimated records: {estimated_records:,}[/yellow]")
+                    console.print(f"[yellow]Estimated time: {total_requests / args.rps / 60:.1f} minutes[/yellow]")
+                else:
+                    print(f"Will make {total_requests} requests. Estimated time: {total_requests / args.rps / 60:.1f} minutes")
+            else:
+                if console:
+                    console.print(f"[yellow]Will make {total_requests} requests for ALL items. This may take a while...[/yellow]")
+                else:
+                    print(f"Will make {total_requests} requests for ALL items. This may take a while...")
+            
+            collected_5m = 0
+            for idx, timestamp in enumerate(timestamps):
+                if shutdown_event.is_set():
+                    break
+                
+                try:
+                    rate_limiter.wait()
+                    prices_5m_hist = client.get_5m(timestamp=timestamp)
+                    
+                    # Filter by target items if specified
+                    if target_items:
+                        prices_5m_hist = {
+                            k: v for k, v in prices_5m_hist.items() 
+                            if int(k) in target_items
+                        }
+                    
+                    count = data_store.save_5m_prices(prices_5m_hist, timestamp=timestamp)
+                    collected_5m += count
+                    
+                    # Progress update and save every 100 requests
+                    if (idx + 1) % 100 == 0:
+                        # Flush data to disk
+                        data_store._write_5m_prices()
+                        
+                        progress = (idx + 1) / total_requests * 100
+                        if console:
+                            console.print(f"Progress: {idx + 1}/{total_requests} ({progress:.1f}%) | Collected: {collected_5m:,} records")
+                        else:
+                            print(f"Progress: {idx + 1}/{total_requests} ({progress:.1f}%)")
+                
+                except RateLimitError:
+                    logger.warning("Rate limited during 5m backfill, backing off...")
+                    rate_limiter.trigger_backoff(30.0)
+                except Exception as e:
+                    logger.error(f"Error backfilling 5m data for timestamp {timestamp}: {e}")
+            
+            logger.info(f"Backfilled {collected_5m:,} 5m records from {len(timestamps)} timestamps")
+            if console:
+                console.print(f"[bold green]✓ Backfilled {collected_5m:,} 5m records[/bold green]")
 
         # Step 5: Load checkpoint if resuming
         completed_items = set()
@@ -336,6 +444,14 @@ def main():
         # Filter out completed items
         remaining_items = [item_id for item_id in all_item_ids if item_id not in completed_items]
         stats.items_completed = len(completed_items)
+
+        # Skip timeseries collection if requested (for 5m-only runs)
+        if args.skip_timeseries:
+            if console:
+                console.print("[yellow]Skipping timeseries collection (--skip-timeseries)[/yellow]")
+            else:
+                print("Skipping timeseries collection")
+            remaining_items = []
 
         if console:
             console.print(f"[bold]Collecting timeseries for {len(remaining_items)} items with {args.workers} workers[/bold]")
