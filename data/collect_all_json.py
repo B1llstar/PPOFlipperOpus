@@ -193,7 +193,7 @@ class CheckpointManager:
 def collect_item_data(
     item_id: int,
     client: GrandExchangeClient,
-    data_store: JSONDataStore,
+    data_store: MongoDataStore,
     stats: CollectionStats,
     rate_limiter: RateLimiter
 ) -> bool:
