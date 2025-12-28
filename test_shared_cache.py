@@ -68,8 +68,8 @@ if __name__ == "__main__":
     print(f"Cache has {len(cache.items)} items")
     
     # Spawn multiple workers
-    print(f"\nSpawning 5 worker processes (passing shared memory name: {shm_name})...")
-    num_workers = 5
+    print(f"\nSpawning 2 worker processes (passing shared memory name: {shm_name})...")
+    num_workers = 2
     
     try:
         with multiprocessing.Pool(num_workers) as pool:
