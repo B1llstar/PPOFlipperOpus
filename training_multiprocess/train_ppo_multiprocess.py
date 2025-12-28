@@ -96,8 +96,6 @@ def worker_process(
             initial_cash=env_kwargs["initial_cash"],
             episode_length=env_kwargs["episode_length"],
             top_n_items=env_kwargs["top_n_items"],
-            transaction_fee=env_kwargs.get("transaction_fee", 0.01),
-            max_inventory_slots=env_kwargs.get("max_inventory_slots", 500),
             seed=worker_id * 1000 + np.random.randint(0, 1000)
         )
         logger.info(f"Environment created: {len(env.tradeable_items)} tradeable items")
@@ -242,7 +240,7 @@ def worker_process(
             if step % save_every < rollout_steps or step >= max_steps:
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
                 agent.save_checkpoint(str(checkpoint_path))
-                logger.info(f"✓ Checkpoint saved: {checkpoint_path.name}")
+                logger.info(f"[OK] Checkpoint saved: {checkpoint_path.name}")
         
         # Save final checkpoint
         final_path = save_dir / f"worker_{worker_id}_final.pt"
@@ -287,11 +285,11 @@ def main():
     # Set multiprocessing start method
     try:
         mp.set_start_method('spawn', force=True)
-        logger.info("✓ Multiprocessing start method: spawn")
+        logger.info("[OK] Multiprocessing start method: spawn")
     except RuntimeError:
-        logger.info("✓ Multiprocessing start method already set to spawn")
+        logger.info("[OK] Multiprocessing start method already set to spawn")
     
-    logger.info(f"✓ Save directory: {save_dir}")
+    logger.info(f"[OK] Save directory: {save_dir}")
     
     # Pre-load cache into shared memory
     cache_file = ENV_KWARGS["cache_file"]
@@ -302,13 +300,13 @@ def main():
         from training.cached_market_loader import load_cache
         load_cache(cache_file, use_shared_memory=True)
         cache_time = time.time() - cache_start
-        logger.info(f"✓ Cache loaded in shared memory ({cache_time:.1f}s)")
+        logger.info(f"[OK] Cache loaded in shared memory ({cache_time:.1f}s)")
     else:
-        logger.info("✓ Shared cache disabled, each worker will load independently")
+        logger.info("[OK] Shared cache disabled, each worker will load independently")
     
     # Hardware info
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    logger.info(f"✓ Available GPUs: {num_gpus}")
+    logger.info(f"[OK] Available GPUs: {num_gpus}")
     if num_gpus > 0:
         for i in range(num_gpus):
             gpu_name = torch.cuda.get_device_name(i)
@@ -317,10 +315,10 @@ def main():
     
     # Configuration
     num_workers = TRAIN_KWARGS["num_workers"]
-    logger.info(f"✓ Number of workers: {num_workers}")
-    logger.info(f"✓ Steps per worker: {TRAIN_KWARGS['max_steps_per_worker']:,}")
-    logger.info(f"✓ Rollout steps: {PPO_KWARGS['rollout_steps']:,}")
-    logger.info(f"✓ Top N items: {ENV_KWARGS['top_n_items']}")
+    logger.info(f"[OK] Number of workers: {num_workers}")
+    logger.info(f"[OK] Steps per worker: {TRAIN_KWARGS['max_steps_per_worker']:,}")
+    logger.info(f"[OK] Rollout steps: {PPO_KWARGS['rollout_steps']:,}")
+    logger.info(f"[OK] Top N items: {ENV_KWARGS['top_n_items']}")
     
     # Combined config for workers
     config = {
@@ -357,7 +355,7 @@ def main():
         )
         p.start()
         workers.append(p)
-        logger.info(f"✓ Started worker {worker_id} (PID: {p.pid}, Device: {'GPU '+str(device_id) if device_id >= 0 else 'CPU'})")
+        logger.info(f"[OK] Started worker {worker_id} (PID: {p.pid}, Device: {'GPU '+str(device_id) if device_id >= 0 else 'CPU'})")
         time.sleep(0.5)  # Stagger starts slightly
     
     logger.info("="*80)

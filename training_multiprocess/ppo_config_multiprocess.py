@@ -1,17 +1,22 @@
 """
 Multiprocess PPO Configuration
 
-Optimized settings for parallel training on H100 GPU.
+Optimized settings for parallel training.
+
+Hardware Profiles:
+- H100 SXM 80GB: 20 workers, 150 items, 2048 rollout
+- RTX 3090 24GB: 5 workers, 80 items, 1024 rollout (for local testing)
 """
+
+# Hardware profile selection
+USE_3090_PROFILE = True  # Set to True for RTX 3090 testing, False for H100
 
 # Environment Configuration
 ENV_KWARGS = {
     "cache_file": "training_cache.json",
     "initial_cash": 1_000_000,
     "episode_length": 168,  # 1 week of hourly data
-    "top_n_items": 150,     # More items for diverse experiences across workers
-    "transaction_fee": 0.01,
-    "max_inventory_slots": 500,
+    "top_n_items": 80 if USE_3090_PROFILE else 150,  # 3090: 80 items | H100: 150 items
 }
 
 # PPO Agent Configuration
@@ -35,11 +40,13 @@ PPO_KWARGS = {
 
 # Training Configuration
 TRAIN_KWARGS = {
-    "num_workers": 20,              # 20 workers = ~70GB VRAM (87.5%), 15% buffer for spikes
-    "max_steps_per_worker": 1_000_000,  # Max steps per worker
-    "save_every_steps": 50_000,     # Save checkpoint frequency
-    "log_every_steps": 1_000,       # Log frequency
-    "eval_every_steps": 25_000,     # Evaluation frequency
+    # 3090: 5 workers × 3.5GB = ~17.5GB (73% of 24GB, safe buffer)
+    # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, 15% buffer)
+    "num_workers": 5 if USE_3090_PROFILE else 20,
+    "max_steps_per_worker": 100_000 if USE_3090_PROFILE else 1_000_000,  # 3090: shorter for testing
+    "save_every_steps": 10_000 if USE_3090_PROFILE else 50_000,  # 3090: more frequent saves
+    "log_every_steps": 500 if USE_3090_PROFILE else 1_000,  # 3090: more frequent logs
+    "eval_every_steps": 5_000 if USE_3090_PROFILE else 25_000,
     "use_shared_cache": True,       # Use shared memory for cache
     "gpu_distribution": "round-robin",  # How to assign GPUs (single GPU: all workers share GPU 0)
 }
