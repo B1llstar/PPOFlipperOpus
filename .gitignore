@@ -61,3 +61,5 @@ models/
 # OS files
 .DS_Store
 Thumbs.db
+mongo_data/ppoflipper.GEData.json
+training_cache.json
