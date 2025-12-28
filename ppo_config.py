@@ -18,7 +18,7 @@ ENV_KWARGS = {
     "episode_length": 168,  # 1 week of hourly steps (168 hours)
     
     # Top N items to trade
-    "top_n_items": 999999,  # Load all available items (no limit)
+    "top_n_items": 100,  # Load 100 items (balance between coverage and startup speed)
     
     # Database/cache settings - NO DATABASE, use cache only
     "db_path": None,  # No SQLite database
@@ -73,7 +73,7 @@ PPO_KWARGS = {
 # Training configuration
 TRAIN_KWARGS = {
     # Multi-agent training
-    "num_agents": 16,  # Number of agents to run in parallel (optimized for h100 sxm with 20 vcpus)
+    "num_agents": 5,  # Number of agents (5 for single-process, 16+ for multiprocess)
 
     # Training duration
     "total_timesteps": 1_000_000,
