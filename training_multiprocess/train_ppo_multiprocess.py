@@ -274,7 +274,7 @@ def worker_process(
             # Save checkpoint
             if step % save_every < rollout_steps or step >= max_steps:
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
-                agent.save_checkpoint(str(checkpoint_path))
+                agent.save(str(checkpoint_path))
                 logger.info(f"[OK] Checkpoint saved: {checkpoint_path.name}")
         
         # Close progress bar
@@ -282,7 +282,7 @@ def worker_process(
         
         # Save final checkpoint
         final_path = save_dir / f"worker_{worker_id}_final.pt"
-        agent.save_checkpoint(str(final_path))
+        agent.save(str(final_path))
         
         # Final summary
         total_time = time.time() - start_time
