@@ -71,7 +71,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ppo_agent import PPOAgent
 from ppo_config import ENV_KWARGS, PPO_KWARGS
 from tax_log import log_tax_payment, log_tax_summary, create_tax_report
-from api.ge_rest_client import GrandExchangeClient
 
 import json
 import threading
@@ -119,8 +118,75 @@ def manage_volume_blacklist_log(content, mode='a', max_entries=1000):
                 f.write(f"[LOG RESET DUE TO ERROR AT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n\n")
                 f.write(content)
 
+def load_training_cache():
+    """Load all necessary data from ge_prices_export.json (lightweight version)."""
+    # Use the smaller ge_prices_export.json which only has item metadata
+    cache_path = "ge_prices_export.json"
+    logger.info(f"Loading training data from {cache_path}...")
+    
+    try:
+        with open(cache_path, 'r') as f:
+            cache_data = json.load(f)
+        
+        items_list = cache_data.get('items', [])
+        logger.info(f"Loaded cache data for {len(items_list)} items")
+        
+        # Extract mappings and create synthetic price/volume data
+        id_name_map = {}
+        buy_limits_map = {}
+        marketplace_data = {}
+        volume_data_5m = {}
+        volume_data_1h = {}
+        
+        for item_info in items_list:
+            item_id = str(item_info.get('id'))
+            item_name = item_info.get('name', f'Item {item_id}')
+            
+            id_name_map[item_id] = item_name
+            buy_limits_map[item_id] = item_info.get('ge_limit', 5000)
+            
+            # Use highalch value as base price estimation (this is just for initialization)
+            base_price = item_info.get('highalch', 100)
+            if base_price is None or base_price == 0:
+                base_price = item_info.get('value', 100)
+            if base_price is None or base_price == 0:
+                base_price = 100  # Fallback default
+            
+            # Create synthetic marketplace data
+            marketplace_data[item_id] = {
+                'high': int(base_price * 1.1),
+                'low': int(base_price * 0.9),
+                'highTime': int(time.time()),
+                'lowTime': int(time.time())
+            }
+            
+            # Create synthetic volume data (training will use actual historical data)
+            volume_data_5m[item_id] = {
+                'avgHighPrice': base_price,
+                'avgLowPrice': base_price,
+                'highPriceVolume': 1000,  # Default volume
+                'lowPriceVolume': 1000,
+                'timestamp': int(time.time())
+            }
+            volume_data_1h[item_id] = volume_data_5m[item_id].copy()
+        
+        logger.info(f"Extracted {len(marketplace_data)} items with price data")
+        logger.info("Note: Using item metadata for initialization. Actual training uses historical price data from environment.")
+        return id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h
+        
+    except FileNotFoundError:
+        logger.error(f"Training cache file not found: {cache_path}")
+        logger.error("Please run: python data/export_training_data.py or ensure ge_prices_export.json exists")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading training cache: {e}")
+        raise
+
 def read_mapping_file():
     """Read the mapping file to get item IDs, names, and buy limits."""
+    # This function is now deprecated in favor of load_training_cache()
+    # but kept for backwards compatibility
+    logger.warning("read_mapping_file() is deprecated, use load_training_cache() instead")
     mapping_path = "endpoints/mapping.txt"
     id_name_map = {}
     buy_limits_map = {}
@@ -133,32 +199,19 @@ def read_mapping_file():
                 item_name = item.get('name')
                 if item_id and item_name:
                     id_name_map[item_id] = item_name
-                    # Buy limits might be in a different format, adjust as needed
-                    buy_limits_map[item_id] = item.get('limit', 5000)  # Default to 5000 if not specified
+                    buy_limits_map[item_id] = item.get('limit', 5000)
         logger.info(f"Loaded mapping data for {len(id_name_map)} items")
     except Exception as e:
         logger.error(f"Error reading mapping file: {e}")
-        # Provide some minimal default data if file can't be read
         id_name_map = {"554": "Fire rune", "555": "Water rune", "556": "Air rune"}
         buy_limits_map = {"554": 10000, "555": 10000, "556": 10000}
     
     return id_name_map, buy_limits_map
 
-def fetch_marketplace_data(client):
-    """Fetch marketplace data from the GrandExchangeClient."""
-    try:
-        # Get latest prices
-        latest_data = client.get_latest()
-        logger.info(f"Fetched latest marketplace data for {len(latest_data)} items")
-        return latest_data
-    except Exception as e:
-        logger.error(f"Error fetching marketplace data: {e}")
-        # Return minimal default data if API fails
-        return {
-            "554": {"high": 5, "low": 4, "highTime": int(time.time()), "lowTime": int(time.time())},
-            "555": {"high": 5, "low": 4, "highTime": int(time.time()), "lowTime": int(time.time())},
-            "556": {"high": 5, "low": 4, "highTime": int(time.time()), "lowTime": int(time.time())}
-        }
+def fetch_marketplace_data(marketplace_data):
+    """Return pre-loaded marketplace data (no API call)."""
+    logger.info(f"Using cached marketplace data for {len(marketplace_data)} items")
+    return marketplace_data
 
 def build_items_dict(id_name_map, buy_limits_map, marketplace_data):
     """Build a dictionary of items using mapping data and marketplace data, with optional strict mode."""
@@ -313,21 +366,20 @@ def update_items_periodically(client, id_name_map, buy_limits_map, interval, cal
 def make_env(agent_idx=0, items=None, volume_analyzer=None):
     # Use a unique random seed for each agent to ensure independent environments
     env_kwargs = dict(ENV_KWARGS)
-    if items is not None:
-        env_kwargs["items"] = items
-    env_kwargs["random_seed"] = np.random.randint(0, 10000)  # Assign a unique random seed for each agent
-    env_kwargs["starting_gp"] = ENV_KWARGS["starting_gp"]  # Use starting_gp from config
-
-    # Remove 'strict_mode' from env_kwargs as GrandExchangeEnv does not accept it
-    if 'strict_mode' in env_kwargs:
-        del env_kwargs['strict_mode']
     
-    # Pass volume analyzer to the environment if available
-    if volume_analyzer is not None:
-        env_kwargs["volume_analyzer"] = volume_analyzer
+    # GrandExchangeEnv only accepts specific parameters
+    # Remove any extra parameters that aren't in the constructor
+    allowed_params = {
+        'db_path', 'cache_file', 'initial_cash', 'episode_length',
+        'top_n_items', 'ge_limit_multiplier', 'include_volume_constraint',
+        'render_mode', 'seed', 'timestep'
+    }
     
-    # Note: Speed optimizations are implemented in the agent_worker function instead
-    # since GrandExchangeEnv doesn't support these parameters directly
+    # Filter to only allowed parameters
+    env_kwargs = {k: v for k, v in env_kwargs.items() if k in allowed_params}
+    
+    # Set unique seed for each agent
+    env_kwargs["seed"] = agent_idx + np.random.randint(0, 10000)
     
     return GrandExchangeEnv(**env_kwargs)
 
@@ -354,9 +406,9 @@ def compute_gae(rewards, values, dones, gamma, lam):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    id_name_map, buy_limits_map = read_mapping_file()
-    client = GrandExchangeClient()
-    marketplace_data = fetch_marketplace_data(client)
+    # Load all data from training cache (NO API CALLS)
+    id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h = load_training_cache()
+    marketplace_data = fetch_marketplace_data(marketplace_data)
     
     # Get strict mode and high volume items path from config
     strict_mode = ENV_KWARGS.get("strict_mode", False)
@@ -366,8 +418,8 @@ def main():
     
     items = build_items_dict(id_name_map, buy_limits_map, marketplace_data)
     
-    # Fetch 1h volume data before getting item lists
-    volume_data = client.get_1h()
+    # Use cached 1h volume data
+    volume_data = volume_data_1h
     
     # id_to_name_map is already created above
     
@@ -405,10 +457,10 @@ def main():
     # Initialize volume analyzer
     volume_analyzer = create_volume_analyzer(id_to_name_map)
     
-    # Update volume analyzer with initial data
-    data_5m = client.get_5m()
+    # Update volume analyzer with cached data (NO API CALLS)
+    data_5m = volume_data_5m
     volume_analyzer.update_volume_data(data_5m, volume_data)
-    logger.info(f"Initialized volume analyzer with {len(data_5m)} 5m items and {len(volume_data)} 1h items")
+    logger.info(f"Initialized volume analyzer with {len(data_5m)} 5m items and {len(volume_data)} 1h items from cache")
     
     # Calculate total volume for each item
     item_volumes = {}
@@ -532,9 +584,9 @@ def main():
     # Create shared knowledge repository
     shared_knowledge = SharedKnowledgeRepository(id_to_name_map, name_to_id_map)
     
-    # Initialize with volume data
-    shared_knowledge.update_volume_data(client.get_5m(), client.get_1h())
-    logger.info(f"Shared knowledge repository initialized with volume data")
+    # Initialize with cached volume data (NO API CALLS)
+    shared_knowledge.update_volume_data(volume_data_5m, volume_data_1h)
+    logger.info(f"Shared knowledge repository initialized with cached volume data")
     
     # No need to track GP history in memory; all GP logging will be done via logger
     agents = []
@@ -570,15 +622,15 @@ def main():
         price_ranges = new_price_ranges
         buy_limits = new_buy_limits
         
-        # Update volume blacklist with new data
+        # Update volume blacklist with cached data (training mode - no API calls)
         try:
-            # Fetch fresh 1h and 5m volume data
-            volume_data = client.get_1h()
-            data_5m = client.get_5m()
+            # Use cached volume data instead of fetching fresh data
+            volume_data = volume_data_1h
+            data_5m = volume_data_5m
             
-            # Update volume analyzer with fresh data
-            volume_analyzer.update_volume_data(data_5m, volume_data)
-            logger.info("Updated volume analyzer with fresh market data")
+            # Note: In training mode, we use static cached data
+            # volume_analyzer already has the cached data loaded
+            logger.info("Using cached volume data (training mode - no API calls)")
             
             # Calculate total volume for each item
             item_volumes = {}
@@ -716,16 +768,16 @@ def main():
                     if item not in agent.volume_blacklist:
                         logger.error(f"Agent {i} missing blacklisted item: {item}")
 
-    # Function to verify volume data from endpoints
+    # Function to verify volume data from cached data (training mode)
     def verify_volume_data():
         """
-        Verify that volume data from 5m and 1h endpoints is being properly received and processed.
+        Verify that cached volume data is properly loaded and processed.
         Logs detailed information about the data quality and any issues found.
         """
         try:
-            # Fetch fresh data
-            data_5m = client.get_5m()
-            data_1h = client.get_1h()
+            # Use cached data (NO API CALLS in training mode)
+            data_5m = volume_data_5m
+            data_1h = volume_data_1h
             
             # Log basic stats
             logger.info(f"Volume data verification - 5m endpoint: {len(data_5m)} items, 1h endpoint: {len(data_1h)} items")
@@ -778,17 +830,14 @@ def main():
     logger.info("Running initial volume data verification...")
     verify_volume_data()
     
-    # Periodically update shared knowledge with fresh volume data
+    # Periodically update shared knowledge (disabled in training mode - using cached data)
     def update_shared_knowledge():
         while True:
             try:
-                # Fetch fresh volume data
-                data_5m = client.get_5m()
-                data_1h = client.get_1h()
-                
-                # Update shared knowledge
-                shared_knowledge.update_volume_data(data_5m, data_1h)
-                logger.info(f"Updated shared knowledge with fresh volume data")
+                # In training mode, we use static cached data, no periodic updates needed
+                logger.info(f"Training mode: using static cached volume data (no periodic updates)")
+                time.sleep(3600)  # Sleep for 1 hour
+                continue  # Skip the actual update
                 
                 # Periodically verify data quality (every 6 hours)
                 current_hour = datetime.now().hour
@@ -1240,16 +1289,14 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
         
         # Create environment with historical client
         env_kwargs = dict(ENV_KWARGS)
-        env_kwargs["items"] = items
-        env_kwargs["historical_client"] = historical_client
-        env_kwargs["name_to_id_map"] = name_to_id_map
-        env_kwargs["id_to_name_map"] = id_to_name_map
         
-        # Remove 'strict_mode' and 'use_historical_data' from env_kwargs
-        if 'strict_mode' in env_kwargs:
-            del env_kwargs['strict_mode']
-        if 'use_historical_data' in env_kwargs:
-            del env_kwargs['use_historical_data']
+        # Filter to only parameters that GrandExchangeEnv accepts
+        allowed_params = {
+            'db_path', 'cache_file', 'initial_cash', 'episode_length',
+            'top_n_items', 'ge_limit_multiplier', 'include_volume_constraint',
+            'render_mode', 'seed', 'timestep'
+        }
+        env_kwargs = {k: v for k, v in env_kwargs.items() if k in allowed_params}
             
         env = GrandExchangeEnv(**env_kwargs)
     else:
@@ -3038,15 +3085,13 @@ if __name__ == "__main__":
         log_queue = multiprocessing.Queue(-1)
         listener = start_logging_listener(log_queue)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Need to initialize items similar to main()
-        id_name_map, buy_limits_map = read_mapping_file()
-        client = GrandExchangeClient()
-        marketplace_data = fetch_marketplace_data(client)
+        # Load all data from training cache (NO API CALLS)
+        id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h = load_training_cache()
+        marketplace_data = fetch_marketplace_data(marketplace_data)
         items = build_items_dict(id_name_map, buy_limits_map, marketplace_data)
         item_list, price_ranges, buy_limits = get_item_lists(items)
         
         # Initialize volume analyzer
-        volume_data = client.get_1h()
         id_to_name_map = {}
         for item_id, item_name in id_name_map.items():
             id_to_name_map[item_id] = item_name
@@ -3054,10 +3099,9 @@ if __name__ == "__main__":
         # Create volume analyzer
         volume_analyzer = create_volume_analyzer(id_to_name_map)
         
-        # Update volume analyzer with initial data
-        data_5m = client.get_5m()
-        volume_analyzer.update_volume_data(data_5m, volume_data)
-        logger.info(f"Initialized volume analyzer with {len(data_5m)} 5m items and {len(volume_data)} 1h items")
+        # Update volume analyzer with cached data (NO API CALLS)
+        volume_analyzer.update_volume_data(volume_data_5m, volume_data_1h)
+        logger.info(f"Initialized volume analyzer with {len(volume_data_5m)} 5m items and {len(volume_data_1h)} 1h items from cache")
         processes = []
         NUM_AGENTS = 5
         for agent_idx in range(NUM_AGENTS):

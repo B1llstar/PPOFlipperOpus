@@ -10,37 +10,25 @@ import torch
 # Environment configuration
 ENV_KWARGS = {
     # Starting capital
-    "starting_gp": 10_000_000,  # 10M GP
+    "initial_cash": 1000000,  # 1M GP
 
     # Episode settings
     # Note: episode_length + LOOKBACK_PERIODS (24) must be <= available hourly data points
     # With 365 hours of 1h data, max episode_length is ~300-340
-    "max_steps": 168,  # 1 week of hourly steps (168 hours)
-    "step_interval": 60,  # Seconds per step (simulated)
-
-    # Trading constraints
-    "ge_tax_rate": 0.01,  # 1% GE tax on sells
-    "ge_slots": 8,  # Number of GE slots
-
-    # Volume filtering
-    "min_volume_threshold": 1000,  # Minimum volume to consider trading
-    "volume_momentum_threshold": -0.2,  # Reject items with declining volume below this
-
-    # Price constraints
-    "max_spread_pct": 0.15,  # Maximum spread percentage to consider
-    "min_spread_pct": 0.01,  # Minimum spread to be profitable after tax
-
-    # Risk management
-    "max_position_pct": 0.25,  # Max % of portfolio in single item
-    "max_order_pct": 0.10,  # Max % of GP per single order
-
-    # Strict mode for item selection (only high volume items)
-    "strict_mode": False,
-    "high_vol_items_path": "config/high_vol_items.txt",
-
-    # Random subset selection (for diversity in training)
-    "random_item_subset": False,
-    "subset_fraction": 0.7,
+    "episode_length": 168,  # 1 week of hourly steps (168 hours)
+    
+    # Top N items to trade
+    "top_n_items": 50,  # Number of items to trade
+    
+    # Database/cache settings - NO DATABASE, use cache only
+    "db_path": None,  # No SQLite database
+    "cache_file": "training_cache.json",  # Use cache file instead of database
+    
+    # GE limit multiplier
+    "ge_limit_multiplier": 1.0,  # Scale GE limits (1.0 = realistic)
+    
+    # Volume constraint
+    "include_volume_constraint": True,  # Include volume constraints
 }
 
 # PPO hyperparameters
