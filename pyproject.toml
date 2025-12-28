@@ -11,6 +11,8 @@ dependencies = [
     "stable-baselines3>=2.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "firebase-admin>=6.0.0",
+    "google-cloud-firestore>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["api", "data", "training", "inference", "tests", "config"]
+packages = ["api", "data", "training", "inference", "tests", "config", "firebase"]
 
 [tool.uv]
 dev-dependencies = [
