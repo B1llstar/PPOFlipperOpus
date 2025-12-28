@@ -1,58 +1,51 @@
 """
 Multiprocess PPO Configuration
 
-Optimized settings for parallel training.
-
-Hardware Profiles:
-- H100 SXM 80GB: 20 workers, 150 items, 2048 rollout
-- RTX 3090 24GB: 5 workers, 80 items, 1024 rollout (for local testing)
+Production settings for H100 SXM 80GB parallel training.
+20 workers, 150 items, optimized for convergence.
 """
-
-# Hardware profile selection
-USE_3090_PROFILE = True  # Set to True for RTX 3090 testing, False for H100
 
 # Environment Configuration
 ENV_KWARGS = {
-    "cache_file": "training_cache.json",
-    "initial_cash": 1_000_000,
-    "episode_length": 168,  # 1 week of hourly data
-    "top_n_items": 20 if USE_3090_PROFILE else 999999999,  # 3090: 80 items | H100: 150 items
+    "cache_file": "training_cache.json",  # JSON file containing cached historical price data
+    "initial_cash": 1_000_000,  # Starting capital (gp) for each trading episode
+    "episode_length": 864,  # Number of time steps per episode (864 = 3 days at 5min intervals)
+    "top_n_items": 999_999_999,  # Maximum number of items to include (effectively unlimited)
 }
 
 # PPO Agent Configuration
 PPO_KWARGS = {
-    "hidden_size": 512,
-    "num_layers": 3,
-    "lr": 3e-4,
-    "gamma": 0.99,
-    "gae_lambda": 0.95,
-    "clip_epsilon": 0.2,
-    "entropy_coef": 0.01,
-    "value_coef": 0.5,
-    "price_bins": 20,
-    "quantity_bins": 10,
-    "wait_steps_bins": 10,
-    "risk_tolerance": 0.3,
-    "rollout_steps": 2048,      # Steps before update
-    "minibatch_size": 64,       # Batch size for training
-    "ppo_epochs": 10,           # Epochs per update
+    "hidden_size": 512,  # Number of neurons in each hidden layer of the neural network
+    "num_layers": 3,  # Number of hidden layers in the policy and value networks
+    "lr": 3e-4,  # Learning rate for Adam optimizer (0.0003)
+    "gamma": 0.99,  # Discount factor for future rewards (0.99 = highly values future)
+    "gae_lambda": 0.95,  # Lambda parameter for Generalized Advantage Estimation
+    "clip_epsilon": 0.2,  # PPO clipping range to prevent large policy updates
+    "entropy_coef": 0.08,  # Coefficient for entropy bonus (encourages exploration)
+    "value_coef": 0.5,  # Coefficient for value function loss in total loss
+    "price_bins": 20,  # Number of discrete price levels for action space
+    "quantity_bins": 10,  # Number of discrete quantity levels for action space
+    "wait_steps_bins": 10,  # Number of discrete wait time options for action space
+    "risk_tolerance": 0.3,  # Maximum portfolio allocation per single item (30%)
+    "rollout_steps": 2048,  # Number of environment steps collected before policy update
+    "minibatch_size": 64,  # Batch size for minibatch SGD during policy optimization
+    "ppo_epochs": 10,  # Number of epochs to train on each batch of rollout data
 }
 
 # Training Configuration
 TRAIN_KWARGS = {
-    # 3090: 5 workers × 3.5GB = ~17.5GB (73% of 24GB, safe buffer)
-    # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, 15% buffer)
-    "num_workers": 2 if USE_3090_PROFILE else 20,
-    "max_steps_per_worker": 100_000 if USE_3090_PROFILE else 1_000_000,  # 3090: shorter for testing
-    "save_every_steps": 10_000 if USE_3090_PROFILE else 50_000,  # 3090: more frequent saves
-    "log_every_steps": 500 if USE_3090_PROFILE else 1_000,  # 3090: more frequent logs
-    "eval_every_steps": 5_000 if USE_3090_PROFILE else 25_000,
-    "use_shared_cache": True,       # Use shared memory for cache
-    "gpu_distribution": "round-robin",  # How to assign GPUs (single GPU: all workers share GPU 0)
+    # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, safe buffer)
+    "num_workers": 20,  # Number of parallel environment workers for data collection
+    "max_steps_per_worker": 10_000_000,  # Maximum training steps per worker (10M total)
+    "save_every_steps": 10_000,  # Save model checkpoint every N steps
+    "log_every_steps": 1_000,  # Log training metrics (loss, rewards) every N steps
+    "eval_every_steps": 25_000,  # Run evaluation episodes every N steps
+    "use_shared_cache": True,  # Share price data cache across workers via shared memory
+    "gpu_distribution": "round-robin",  # Strategy for distributing workers across GPUs
 }
 
 # Evaluation Configuration
 EVAL_KWARGS = {
-    "num_episodes": 10,
-    "deterministic": True,
+    "num_episodes": 10,  # Number of episodes to run during each evaluation
+    "deterministic": True,  # Use deterministic policy (no exploration) for evaluation
 }
