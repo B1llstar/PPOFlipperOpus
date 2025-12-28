@@ -69,7 +69,7 @@ from volume_analysis import VolumeAnalyzer, create_volume_analyzer, update_volum
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ppo_agent import PPOAgent
-from ppo_config import ENV_KWARGS, PPO_KWARGS
+from ppo_config import ENV_KWARGS, PPO_KWARGS, TRAIN_KWARGS
 from tax_log import log_tax_payment, log_tax_summary, create_tax_report
 
 import json
@@ -579,7 +579,8 @@ def main():
     manage_volume_blacklist_log(log_content, mode='w')
 
     # === Multi-Agent Setup with Shared Knowledge ===
-    NUM_AGENTS = 5
+    NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
+    logger.info(f"Training with {NUM_AGENTS} parallel agents")
     
     # Create shared knowledge repository
     shared_knowledge = SharedKnowledgeRepository(id_to_name_map, name_to_id_map)
@@ -3103,7 +3104,8 @@ if __name__ == "__main__":
         volume_analyzer.update_volume_data(volume_data_5m, volume_data_1h)
         logger.info(f"Initialized volume analyzer with {len(volume_data_5m)} 5m items and {len(volume_data_1h)} 1h items from cache")
         processes = []
-        NUM_AGENTS = 5
+        NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
+        logger.info(f"Starting {NUM_AGENTS} parallel agent workers")
         for agent_idx in range(NUM_AGENTS):
             p = multiprocessing.Process(
                 target=agent_worker,

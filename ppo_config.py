@@ -10,7 +10,7 @@ import torch
 # Environment configuration
 ENV_KWARGS = {
     # Starting capital
-    "initial_cash": 1000000,  # 1M GP
+    "initial_cash": 1_000_000,  # 1M GP
 
     # Episode settings
     # Note: episode_length + LOOKBACK_PERIODS (24) must be <= available hourly data points
@@ -66,7 +66,7 @@ PPO_KWARGS = {
 # Training configuration
 TRAIN_KWARGS = {
     # Multi-agent training
-    "num_agents": 4,
+    "num_agents": 5,  # Number of agents to run in parallel
 
     # Training duration
     "total_timesteps": 1_000_000,
