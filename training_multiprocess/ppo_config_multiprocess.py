@@ -42,7 +42,7 @@ PPO_KWARGS = {
 TRAIN_KWARGS = {
     # 3090: 5 workers × 3.5GB = ~17.5GB (73% of 24GB, safe buffer)
     # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, 15% buffer)
-    "num_workers": 5 if USE_3090_PROFILE else 20,
+    "num_workers": 2 if USE_3090_PROFILE else 20,
     "max_steps_per_worker": 100_000 if USE_3090_PROFILE else 1_000_000,  # 3090: shorter for testing
     "save_every_steps": 10_000 if USE_3090_PROFILE else 50_000,  # 3090: more frequent saves
     "log_every_steps": 500 if USE_3090_PROFILE else 1_000,  # 3090: more frequent logs
