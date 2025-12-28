@@ -16,7 +16,7 @@ ENV_KWARGS = {
     "cache_file": "training_cache.json",
     "initial_cash": 1_000_000,
     "episode_length": 168,  # 1 week of hourly data
-    "top_n_items": 80 if USE_3090_PROFILE else 150,  # 3090: 80 items | H100: 150 items
+    "top_n_items": 20 if USE_3090_PROFILE else 999999999,  # 3090: 80 items | H100: 150 items
 }
 
 # PPO Agent Configuration

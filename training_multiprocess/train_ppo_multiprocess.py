@@ -318,11 +318,15 @@ def main():
     # Set environment variable to indicate cache is pre-loaded
     os.environ['CACHE_PRELOADED'] = '1'
     
+    shm_name = None
     if TRAIN_KWARGS.get("use_shared_cache", True):
-        from training.cached_market_loader import load_cache
+        from training.cached_market_loader import load_cache, get_shared_memory_name
         load_cache(cache_file, use_shared_memory=True)
+        shm_name = get_shared_memory_name()
         cache_time = time.time() - cache_start
         logger.info(f"[OK] Cache loaded in shared memory ({cache_time:.1f}s)")
+        logger.info(f"[OK] Shared memory name: {shm_name}")
+        os.environ['CACHE_SHM_NAME'] = shm_name if shm_name else ''
     else:
         logger.info("[OK] Shared cache disabled, each worker will load independently")
     
