@@ -448,7 +448,10 @@ def main():
     # Use cached 1h volume data
     volume_data = volume_data_1h
     
-    # id_to_name_map is already created above
+    # Create id_to_name_map early for use below
+    id_to_name_map = {}
+    for item_id, item_name in id_name_map.items():
+        id_to_name_map[item_id] = item_name
     
     # Calculate total volume for each item immediately after building the dictionary
     item_volumes = {}
@@ -475,13 +478,7 @@ def main():
     
     item_list, price_ranges, buy_limits = get_item_lists(items)
     
-    # Create a mapping from item ID to item name
-    id_name_map, _ = read_mapping_file()
-    id_to_name_map = {}
-    for item_id, item_name in id_name_map.items():
-        id_to_name_map[item_id] = item_name
-    
-    # Initialize volume analyzer
+    # Initialize volume analyzer (id_to_name_map already created above)
     volume_analyzer = create_volume_analyzer(id_to_name_map)
     
     # Update volume analyzer with cached data (NO API CALLS)
