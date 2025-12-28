@@ -315,6 +315,9 @@ def main():
     logger.info(f"Pre-loading cache: {cache_file}")
     cache_start = time.time()
     
+    # Set environment variable to indicate cache is pre-loaded
+    os.environ['CACHE_PRELOADED'] = '1'
+    
     if TRAIN_KWARGS.get("use_shared_cache", True):
         from training.cached_market_loader import load_cache
         load_cache(cache_file, use_shared_memory=True)

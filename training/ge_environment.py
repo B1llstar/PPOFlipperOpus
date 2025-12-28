@@ -173,12 +173,22 @@ class GrandExchangeEnv(gym.Env):
             try:
                 from training.cached_market_loader import get_cache, load_cache
                 
-                # Check if cache is already loaded to avoid redundant prints
-                cache = get_cache()
-                if not hasattr(cache, '_loaded') or not cache._loaded:
+                # Get cache (should already be loaded in shared memory by main process)
+                from training.cached_market_loader import get_cache, load_cache
+                import os
+                
+                # If cache was pre-loaded, just get the reference
+                if os.environ.get('CACHE_PRELOADED') == '1':
+                    cache = get_cache()
+                    if not cache._loaded:
+                        # Force reload in case it's not actually loaded
+                        load_cache(self.cache_file, force_reload=False, use_shared_memory=True)
+                        cache = get_cache()
+                else:
+                    # Not pre-loaded, load it now
                     print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
-                load_cache(self.cache_file)
-                cache = get_cache()
+                    load_cache(self.cache_file, force_reload=False, use_shared_memory=False)
+                    cache = get_cache()
                 
                 # Get top N items from cache
                 min_data_points = self.episode_length + self.LOOKBACK_PERIODS
