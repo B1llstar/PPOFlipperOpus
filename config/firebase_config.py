@@ -40,7 +40,9 @@ def get_service_account_path() -> str:
 SERVICE_ACCOUNT_PATH = get_service_account_path()
 
 # Default account ID (can be overridden at runtime)
-DEFAULT_ACCOUNT_ID = os.environ.get("PPO_ACCOUNT_ID", "default_account")
+# IMPORTANT: This must match the player name in RuneLite (lowercased, spaces replaced with underscores)
+# The Java plugin uses client.getLocalPlayer().getName().toLowerCase().replace(" ", "_")
+DEFAULT_ACCOUNT_ID = os.environ.get("PPO_ACCOUNT_ID", "b1llstar")
 
 # ============================================================================
 # Timing Configuration
