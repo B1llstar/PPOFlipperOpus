@@ -173,7 +173,10 @@ class GrandExchangeEnv(gym.Env):
             try:
                 from training.cached_market_loader import get_cache, load_cache
                 
-                print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
+                # Check if cache is already loaded to avoid redundant prints
+                cache = get_cache()
+                if not hasattr(cache, '_loaded') or not cache._loaded:
+                    print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
                 load_cache(self.cache_file)
                 cache = get_cache()
                 
