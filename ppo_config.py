@@ -66,7 +66,7 @@ PPO_KWARGS = {
 # Training configuration
 TRAIN_KWARGS = {
     # Multi-agent training
-    "num_agents": 45,  # Number of agents to run in parallel
+    "num_agents": 17,  # Number of agents to run in parallel (optimized for h100 sxm with 20 vcpus)
 
     # Training duration
     "total_timesteps": 1_000_000,
