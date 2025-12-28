@@ -3117,6 +3117,9 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
                     logger.info(f"GP_LOG | Agent {agent_idx} | Step {step_count} | GP {obs['gp']}")
 
 if __name__ == "__main__":
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    multiprocessing.set_start_method('spawn', force=True)
+    
     # To run agents concurrently with process-safe logging:
     use_multiprocessing = True  # Set to False to use single-process main()
     if use_multiprocessing:
