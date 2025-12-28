@@ -405,7 +405,34 @@ def compute_gae(rewards, values, dones, gamma, lam):
     return advantages, returns
 
 def main():
+    # Hardware acceleration detection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    logger.info("="*60)
+    logger.info("🚀 HARDWARE ACCELERATION STATUS")
+    logger.info("="*60)
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    
+    if torch.cuda.is_available():
+        logger.info(f"✅ GPU ACCELERATION: ENABLED")
+        logger.info(f"  Device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"  CUDA version: {torch.version.cuda}")
+        logger.info(f"  Total VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
+        logger.info(f"  Neural networks will use: GPU (VRAM)")
+    else:
+        logger.info(f"⚠️ GPU ACCELERATION: DISABLED")
+        logger.info(f"  Neural networks will use: CPU (RAM)")
+        logger.info(f"  Training will be significantly slower")
+    
+    logger.info(f"")
+    logger.info(f"💾 MEMORY ALLOCATION:")
+    logger.info(f"  Market cache: CPU RAM (via shared memory)")
+    logger.info(f"  Environments: CPU RAM (worker processes)")
+    logger.info(f"  Neural networks: {'GPU VRAM' if torch.cuda.is_available() else 'CPU RAM'}")
+    logger.info("="*60)
+    logger.info("")
+    
     # Load all data from training cache (NO API CALLS)
     id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h = load_training_cache()
     marketplace_data = fetch_marketplace_data(marketplace_data)
@@ -3096,6 +3123,16 @@ if __name__ == "__main__":
         log_queue = multiprocessing.Queue(-1)
         listener = start_logging_listener(log_queue)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Log hardware info
+        logger.info("="*60)
+        logger.info("🚀 MULTIPROCESSING TRAINING - HARDWARE STATUS")
+        logger.info(f"GPU Available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            logger.info(f"GPU Device: {torch.cuda.get_device_name(0)}")
+            logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
+        logger.info(f"Neural networks training on: {device}")
+        logger.info("="*60)
         
         # PRE-LOAD CACHE IN PARENT PROCESS WITH SHARED MEMORY
         # This loads the 2.4GB cache ONCE into shared memory that all agents access
