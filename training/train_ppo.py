@@ -608,8 +608,8 @@ def main():
     NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
     logger.info(f"Training with {NUM_AGENTS} parallel agents")
     
-    # Create shared knowledge repository
-    shared_knowledge = SharedKnowledgeRepository(id_to_name_map, name_to_id_map)
+    # Create shared knowledge repository (loads mappings internally)
+    shared_knowledge = SharedKnowledgeRepository()
     
     # Initialize with cached volume data (NO API CALLS)
     shared_knowledge.update_volume_data(volume_data_5m, volume_data_1h)
