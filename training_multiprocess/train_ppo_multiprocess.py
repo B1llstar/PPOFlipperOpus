@@ -178,6 +178,7 @@ def gradient_coordinator(
             avg_value_loss = np.mean([info['value_loss'] for info in loss_infos])
             logger.info(
                 f"[Coordinator] Update {update_count}: "
+                f"SHARED MODEL UPDATED - "
                 f"loss={avg_loss:.4f}, pg_loss={avg_pg_loss:.4f}, value_loss={avg_value_loss:.4f}"
             )
             
@@ -185,11 +186,11 @@ def gradient_coordinator(
             param_update_event.set()
             logger.info("[Coordinator] Parameters updated, signaled workers")
             
-            # Periodically save shared model
-            if update_count % 10 == 0:
+            # Save shared model checkpoint periodically
+            if update_count % 5 == 0:  # Save every 5 updates
                 checkpoint_path = save_dir / f"shared_model_update_{update_count}.pt"
                 shared_model.save(str(checkpoint_path))
-                logger.info(f"[Coordinator] Saved shared model: {checkpoint_path.name}")
+                logger.info(f"[Coordinator] ✓ SHARED MODEL CHECKPOINT SAVED: {checkpoint_path.name}")
                 
                 # Manage checkpoint count
                 if max_checkpoints > 0:
@@ -435,7 +436,7 @@ def worker_process(
                 agent.actor.load_state_dict(shared_model.actor.state_dict())
                 agent.critic.load_state_dict(shared_model.critic.state_dict())
                 agent.feature_extractor.load_state_dict(shared_model.feature_extractor.state_dict())
-                logger.info("Parameters updated from shared model")
+                logger.info("✓ Loaded updated parameters from SHARED MODEL")
                 
             else:
                 # Independent training (original behavior)
@@ -482,8 +483,8 @@ def worker_process(
                     'steps_per_sec': steps_per_sec
                 })
             
-            # Save checkpoint
-            if step % save_every < rollout_steps or step >= max_steps:
+            # Save checkpoint (only if NOT using shared model)
+            if shared_model is None and (step % save_every < rollout_steps or step >= max_steps):
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
                 agent.save(str(checkpoint_path))
                 logger.info(f"[OK] Checkpoint saved: {checkpoint_path.name}")
@@ -496,9 +497,13 @@ def worker_process(
         # Close progress bar
         pbar.close()
         
-        # Save final checkpoint
-        final_path = save_dir / f"worker_{worker_id}_final.pt"
-        agent.save(str(final_path))
+        # Save final checkpoint (only if NOT using shared model)
+        if shared_model is None:
+            final_path = save_dir / f"worker_{worker_id}_final.pt"
+            agent.save(str(final_path))
+            logger.info(f"[OK] Final checkpoint saved: {final_path.name}")
+        else:
+            logger.info("Using shared model - skipping worker checkpoint (coordinator handles saves)")
         
         # Final summary
         total_time = time.time() - start_time
