@@ -615,6 +615,14 @@ def main():
     shared_knowledge.update_volume_data(volume_data_5m, volume_data_1h)
     logger.info(f"Shared knowledge repository initialized with cached volume data")
     
+    # Pre-load cache once to avoid each environment loading it separately
+    cache_file = ENV_KWARGS.get("cache_file", "training_cache.json")
+    if cache_file:
+        from training.cached_market_loader import load_cache
+        logger.info(f"Pre-loading cache once for all agents: {cache_file}")
+        load_cache(cache_file, use_shared_memory=False)  # Load into memory once
+        logger.info(f"✓ Cache pre-loaded and ready for {NUM_AGENTS} agents")
+    
     # No need to track GP history in memory; all GP logging will be done via logger
     agents = []
     envs = []
