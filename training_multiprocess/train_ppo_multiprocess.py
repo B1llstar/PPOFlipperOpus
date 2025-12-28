@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 from collections import deque
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -147,6 +148,15 @@ def worker_process(
         start_time = time.time()
         last_log_time = start_time
         
+        # Progress bar for this worker
+        pbar = tqdm(
+            total=max_steps,
+            desc=f"Worker {worker_id}",
+            position=worker_id,
+            leave=True,
+            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+        
         while step < max_steps and not stop_event.is_set():
             # Collect rollout
             for _ in range(rollout_steps):
@@ -167,6 +177,12 @@ def worker_process(
                 episode_reward += reward
                 episode_length += 1
                 step += 1
+                pbar.update(1)
+                pbar.set_postfix({
+                    'ep': episode,
+                    'ep_rew': f'{episode_reward:.1f}',
+                    'avg_rew': f'{np.mean(recent_rewards) if recent_rewards else 0:.1f}'
+                })
                 
                 # Handle episode end
                 if done:
@@ -236,7 +252,10 @@ def worker_process(
                     'steps_per_sec': steps_per_sec
                 })
             
-            # Save checkpoint
+          Close progress bar
+        pbar.close()
+        
+        #   # Save checkpoint
             if step % save_every < rollout_steps or step >= max_steps:
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
                 agent.save_checkpoint(str(checkpoint_path))
