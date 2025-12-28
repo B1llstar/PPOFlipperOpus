@@ -69,12 +69,17 @@ class CachedMarketData:
         """
         Load market data from JSON cache file.
         
+        MULTIPROCESSING OPTIMIZATION:
+        When loaded in parent process before spawning child processes,
+        the cache data is shared via copy-on-write memory, allowing
+        all agents to share the same 2.4GB cache without duplication.
+        
         Args:
             cache_file: Path to JSON cache file
             force_reload: Force reload even if already loaded
         """
         if self._loaded and not force_reload:
-            logger.info("Cache already loaded, skipping reload")
+            logger.info("Cache already loaded, skipping reload (shared memory)")
             return
         
         cache_path = Path(cache_file)

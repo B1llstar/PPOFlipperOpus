@@ -3086,6 +3086,16 @@ if __name__ == "__main__":
         log_queue = multiprocessing.Queue(-1)
         listener = start_logging_listener(log_queue)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # PRE-LOAD CACHE IN PARENT PROCESS (shared via copy-on-write in child processes)
+        # This loads the 2.4GB cache ONCE instead of per-agent
+        cache_file = ENV_KWARGS.get("cache_file", "training_cache.json")
+        if cache_file:
+            from training.cached_market_loader import load_cache
+            logger.info(f"Pre-loading shared cache: {cache_file}")
+            load_cache(cache_file)
+            logger.info("✓ Cache loaded in parent process - will be shared across all agents via copy-on-write")
+        
         # Load all data from training cache (NO API CALLS)
         id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h = load_training_cache()
         marketplace_data = fetch_marketplace_data(marketplace_data)
@@ -3105,7 +3115,7 @@ if __name__ == "__main__":
         logger.info(f"Initialized volume analyzer with {len(volume_data_5m)} 5m items and {len(volume_data_1h)} 1h items from cache")
         processes = []
         NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
-        logger.info(f"Starting {NUM_AGENTS} parallel agent workers")
+        logger.info(f"Starting {NUM_AGENTS} parallel agent workers with shared cache")
         for agent_idx in range(NUM_AGENTS):
             p = multiprocessing.Process(
                 target=agent_worker,
