@@ -47,14 +47,21 @@ PPO_KWARGS = {
     "gamma": 0.99,  # Discount factor
     "gae_lambda": 0.95,  # GAE lambda
     "clip_epsilon": 0.2,  # PPO clip parameter
+    "clip_eps": 0.2,  # PPO clip parameter (alias)
     "entropy_coef": 0.01,  # Entropy bonus coefficient
     "value_coef": 0.5,  # Value loss coefficient
     "max_grad_norm": 0.5,  # Gradient clipping
 
     # Training parameters
     "batch_size": 64,
+    "minibatch_size": 16,  # Minibatch size for PPO updates
     "n_epochs": 10,  # PPO epochs per update
+    "ppo_epochs": 10,  # PPO epochs per update (alias)
     "n_steps": 2048,  # Steps per rollout
+    "rollout_steps": 2048,  # Steps per rollout (alias)
+    "max_steps": 1_000_000,  # Maximum training steps
+    "save_every_steps": 10000,  # Save checkpoint every N steps
+    "save_best_metric": "avg_gp",  # Metric to use for saving best model (avg_gp, profit, etc.)
 
     # Regularization
     "weight_decay": 0.0001,
