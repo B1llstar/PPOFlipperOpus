@@ -1519,7 +1519,7 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
     else:
         reset_result = env.reset()
         obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-    logger.info(f"GP_LOG | Agent {agent_idx} | Step 0 | GP {obs.get('gp', 0)}")
+    logger.info(f"GP_LOG | Agent {agent_idx} | Step 0 | GP {env.cash}")
     step_count = 0
     rollout_steps = ppo_kwargs["rollout_steps"]
     unique_items_traded = {}
@@ -3123,7 +3123,7 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
     
     # To run agents concurrently with process-safe logging:
-    use_multiprocessing = True  # Set to False to use single-process main()
+    use_multiprocessing = False  # Set to False to use single-process main() - REQUIRED: multiprocessing mode incompatible with current environment
     if use_multiprocessing:
         log_queue = multiprocessing.Queue(-1)
         listener = start_logging_listener(log_queue)
