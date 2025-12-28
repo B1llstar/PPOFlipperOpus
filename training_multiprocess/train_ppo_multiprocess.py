@@ -252,14 +252,14 @@ def worker_process(
                     'steps_per_sec': steps_per_sec
                 })
             
-          Close progress bar
-        pbar.close()
-        
-        #   # Save checkpoint
+            # Save checkpoint
             if step % save_every < rollout_steps or step >= max_steps:
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
                 agent.save_checkpoint(str(checkpoint_path))
                 logger.info(f"[OK] Checkpoint saved: {checkpoint_path.name}")
+        
+        # Close progress bar
+        pbar.close()
         
         # Save final checkpoint
         final_path = save_dir / f"worker_{worker_id}_final.pt"
