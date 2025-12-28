@@ -1517,7 +1517,8 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
     if os.path.exists(state_path):
         obs = env._get_obs()
     else:
-        obs = env.reset()
+        reset_result = env.reset()
+        obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
     logger.info(f"GP_LOG | Agent {agent_idx} | Step 0 | GP {obs.get('gp', 0)}")
     step_count = 0
     rollout_steps = ppo_kwargs["rollout_steps"]
@@ -3112,7 +3113,8 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
                     env.save_state(state_path)
                 except Exception as e:
                     logger.error(f"Failed to save environment state for agent {agent_idx}: {e}")
-                obs = env.reset()
+                reset_result = env.reset()
+                obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
                 if step_count % 500 == 0:
                     logger.info(f"GP_LOG | Agent {agent_idx} | Step {step_count} | GP {obs['gp']}")
 
