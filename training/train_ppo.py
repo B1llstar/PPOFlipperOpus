@@ -883,8 +883,9 @@ def main():
     shared_knowledge_thread.start()
     logger.info(f"Started shared knowledge update thread")
     
-    # Also start the regular item updates
-    update_items_periodically(client, id_name_map, buy_limits_map, 300, update_items_callback)
+    # Periodic item updates disabled - using cached data for training
+    # update_items_periodically(client, id_name_map, buy_limits_map, 300, update_items_callback)
+    
     # Set up save directory
     base_save_dir = "agent_states"
     os.makedirs(base_save_dir, exist_ok=True)
