@@ -364,6 +364,17 @@ class InferenceBridge:
         if order_id and order_id in self._pending_order_ids:
             self._pending_order_ids.remove(order_id)
 
+        # Mark the order as completed in Firestore
+        if order_id:
+            filled_quantity = trade_data.get("quantity")
+            total_cost = trade_data.get("total_cost")
+            self.order_manager.complete_order(
+                order_id=order_id,
+                filled_quantity=filled_quantity,
+                total_cost=total_cost,
+                metadata={"trade_id": trade_data.get("trade_id")}
+            )
+
         # Notify external callback
         if self._on_trade_completed:
             try:

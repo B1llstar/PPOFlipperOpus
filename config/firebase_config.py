@@ -20,9 +20,9 @@ def get_service_account_path() -> str:
     """Find the service account JSON file."""
     possible_paths = [
         # Root of PPOFlipperOpus
-        Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-25f1af05a0.json",
+        Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json",
         # Config directory
-        Path(__file__).parent / "ppoflipperopus-firebase-adminsdk-fbsvc-25f1af05a0.json",
+        Path(__file__).parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json",
         # Environment variable
         Path(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")),
         # User home
@@ -34,7 +34,7 @@ def get_service_account_path() -> str:
             return str(path)
 
     # Default to root location
-    return str(Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-25f1af05a0.json")
+    return str(Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json")
 
 
 SERVICE_ACCOUNT_PATH = get_service_account_path()

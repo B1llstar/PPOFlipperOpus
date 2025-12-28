@@ -310,6 +310,49 @@ class OrderManager:
         logger.info(f"Cancelled {count} pending orders")
         return count
 
+    def complete_order(self, order_id: str, filled_quantity: int = None,
+                       total_cost: int = None, metadata: Dict[str, Any] = None) -> bool:
+        """
+        Mark an order as completed.
+
+        Args:
+            order_id: The order ID to complete
+            filled_quantity: Final filled quantity (optional)
+            total_cost: Total cost/revenue (optional)
+            metadata: Additional metadata to store (optional)
+
+        Returns:
+            True if order was marked completed
+        """
+        try:
+            doc_ref = self.client.get_orders_ref().document(order_id)
+            doc = doc_ref.get()
+
+            if not doc.exists:
+                logger.warning(f"Order {order_id} not found for completion")
+                return False
+
+            update_data = {
+                "status": OrderStatus.COMPLETED.value,
+                "completed_at": self._now_iso(),
+                "updated_at": self._now_iso()
+            }
+
+            if filled_quantity is not None:
+                update_data["filled_quantity"] = filled_quantity
+            if total_cost is not None:
+                update_data["total_cost"] = total_cost
+            if metadata:
+                update_data["completion_metadata"] = metadata
+
+            doc_ref.update(update_data)
+            logger.info(f"Marked order as completed: {order_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to complete order {order_id}: {e}")
+            return False
+
     # =========================================================================
     # Status Listening
     # =========================================================================
