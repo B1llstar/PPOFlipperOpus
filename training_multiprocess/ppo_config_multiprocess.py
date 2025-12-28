@@ -15,8 +15,8 @@ ENV_KWARGS = {
 
 # PPO Agent Configuration
 PPO_KWARGS = {
-    "hidden_size": 512,  # Number of neurons in each hidden layer of the neural network
-    "num_layers": 3,  # Number of hidden layers in the policy and value networks
+    "hidden_size": 1024,  # Number of neurons in each hidden layer of the neural network
+    "num_layers": 4,  # Number of hidden layers in the policy and value networks
     "lr": 3e-4,  # Learning rate for Adam optimizer (0.0003)
     "gamma": 0.99,  # Discount factor for future rewards (0.99 = highly values future)
     "gae_lambda": 0.95,  # Lambda parameter for Generalized Advantage Estimation
