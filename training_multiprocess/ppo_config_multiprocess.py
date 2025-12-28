@@ -42,6 +42,8 @@ TRAIN_KWARGS = {
     "eval_every_steps": 25_000,  # Run evaluation episodes every N steps
     "use_shared_cache": True,  # Share price data cache across workers via shared memory
     "gpu_distribution": "round-robin",  # Strategy for distributing workers across GPUs
+    "use_shared_model": True,  # Enable shared model training with gradient aggregation (recommended)
+    "max_checkpoints": 5,  # Maximum number of checkpoints to keep (oldest deleted automatically, 0 = unlimited)
 }
 
 # Evaluation Configuration

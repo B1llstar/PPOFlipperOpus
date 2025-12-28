@@ -789,6 +789,114 @@ class PPOAgent:
 
         return loss.item(), metrics
 
+    def compute_gradients(self, last_obs: Any, last_done: bool, n_epochs: int = 10, batch_size: int = 64) -> Dict[str, float]:
+        """
+        Compute gradients from collected rollout WITHOUT applying optimizer step.
+        For use in distributed training where gradients are aggregated externally.
+        
+        Returns dict of training metrics (same as update()).
+        """
+        # Compute final value for GAE
+        with torch.no_grad():
+            last_value = self.get_value(last_obs)
+
+        # Compute advantages
+        self.buffer.compute_advantages(last_value, last_done)
+
+        # Normalize advantages
+        n = self.buffer.pos if not self.buffer.full else self.buffer.buffer_size
+        adv = self.buffer.advantages[:n]
+        self.buffer.advantages[:n] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # Training metrics
+        all_losses = []
+        all_pg_losses = []
+        all_value_losses = []
+        all_entropy_losses = []
+        all_clip_fractions = []
+
+        # Zero out any existing gradients
+        self.optimizer.zero_grad()
+
+        # Multiple epochs over the data
+        for epoch in range(n_epochs):
+            for batch in self.buffer.get_batches(batch_size):
+                # Get observations
+                obs = batch["observations"]
+                action_types = batch["action_types"]
+                action_items = batch["action_items"]
+                action_prices = batch["action_prices"]
+                action_quantities = batch["action_quantities"]
+                old_log_probs = batch["old_log_probs"]
+                advantages = batch["advantages"]
+                returns = batch["returns"]
+                old_values = batch["old_values"]
+
+                # Forward pass
+                log_probs, entropy, values = self.evaluate_actions(
+                    obs, action_types, action_items, action_prices, action_quantities
+                )
+
+                # Policy loss (clipped surrogate objective)
+                ratio = torch.exp(log_probs - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+                pg_loss = -torch.min(surr1, surr2).mean()
+
+                # Value loss (clipped)
+                if self.clip_value > 0:
+                    values_clipped = old_values + torch.clamp(
+                        values - old_values,
+                        -self.clip_value,
+                        self.clip_value
+                    )
+                    value_loss1 = F.mse_loss(values, returns)
+                    value_loss2 = F.mse_loss(values_clipped, returns)
+                    value_loss = torch.max(value_loss1, value_loss2)
+                else:
+                    value_loss = F.mse_loss(values, returns)
+
+                # Entropy loss (for exploration)
+                entropy_loss = -entropy.mean()
+
+                # Total loss
+                loss = pg_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+
+                # Backward pass (accumulate gradients)
+                loss.backward()
+
+                # Metrics
+                with torch.no_grad():
+                    clip_fraction = (torch.abs(ratio - 1) > self.clip_epsilon).float().mean().item()
+
+                all_losses.append(loss.item())
+                all_pg_losses.append(pg_loss.item())
+                all_value_losses.append(value_loss.item())
+                all_entropy_losses.append(entropy_loss.item())
+                all_clip_fractions.append(clip_fraction)
+
+        # Clip accumulated gradients
+        nn.utils.clip_grad_norm_(self.all_parameters, self.max_grad_norm)
+
+        self.n_updates += 1
+        self.buffer.reset()
+
+        result = {
+            "loss": np.mean(all_losses),
+            "pg_loss": np.mean(all_pg_losses),
+            "value_loss": np.mean(all_value_losses),
+            "entropy_loss": np.mean(all_entropy_losses),
+            "clip_fraction": np.mean(all_clip_fractions),
+            "n_updates": self.n_updates,
+            "total_timesteps": self.total_timesteps
+        }
+
+        self.recent_losses.append(result["loss"])
+        if len(self.recent_losses) > 100:
+            self.recent_losses.pop(0)
+
+        return result
+
     def save(self, path: str):
         """Save agent to file."""
         path = Path(path)

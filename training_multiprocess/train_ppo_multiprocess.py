@@ -51,16 +51,166 @@ def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     return logger
 
 
+def manage_checkpoints(save_dir: Path, worker_id: int, max_checkpoints: int, logger: logging.Logger):
+    """
+    Manage checkpoint files by keeping only the most recent N checkpoints.
+    
+    Args:
+        save_dir: Directory containing checkpoints
+        worker_id: Worker ID (for worker-specific checkpoints) or None for shared model
+        max_checkpoints: Maximum number of checkpoints to keep (0 = unlimited)
+        logger: Logger instance
+    """
+    if max_checkpoints <= 0:
+        return  # Unlimited checkpoints
+    
+    # Find all checkpoint files for this worker/model
+    if worker_id is not None:
+        pattern = f"worker_{worker_id}_step_*.pt"
+    else:
+        pattern = "shared_model_update_*.pt"
+    
+    checkpoints = list(save_dir.glob(pattern))
+    
+    if len(checkpoints) <= max_checkpoints:
+        return  # Within limit
+    
+    # Sort by modification time (oldest first)
+    checkpoints.sort(key=lambda p: p.stat().st_mtime)
+    
+    # Delete oldest checkpoints
+    num_to_delete = len(checkpoints) - max_checkpoints
+    for checkpoint in checkpoints[:num_to_delete]:
+        try:
+            checkpoint.unlink()
+            logger.info(f"Deleted old checkpoint: {checkpoint.name}")
+        except Exception as e:
+            logger.warning(f"Failed to delete checkpoint {checkpoint.name}: {e}")
+
+
+def gradient_coordinator(
+    num_workers: int,
+    shared_model: PPOAgent,
+    gradient_queue: mp.Queue,
+    param_update_event: mp.Event,
+    barrier: mp.Barrier,
+    stop_event: mp.Event,
+    save_dir: Path,
+    logger: logging.Logger,
+    max_checkpoints: int = 0
+):
+    """
+    Coordinator process that aggregates gradients from workers and updates shared model.
+    
+    Args:
+        num_workers: Number of worker processes
+        shared_model: Shared PPOAgent model to update
+        gradient_queue: Queue receiving gradients from workers
+        param_update_event: Event to signal parameter updates
+        barrier: Barrier for synchronizing workers
+        stop_event: Event to signal shutdown
+        save_dir: Directory for saving coordinated checkpoints
+        logger: Logger instance
+        max_checkpoints: Maximum number of checkpoints to keep (0 = unlimited)
+    """
+    logger.info("[Coordinator] Starting gradient coordinator")
+    update_count = 0
+    
+    try:
+        while not stop_event.is_set():
+            # Collect gradients from all workers
+            gradients_batch = []
+            loss_infos = []
+            
+            for _ in range(num_workers):
+                try:
+                    grad_data = gradient_queue.get(timeout=60)
+                    gradients_batch.append(grad_data['gradients'])
+                    loss_infos.append(grad_data['loss_info'])
+                except Exception as e:
+                    logger.error(f"[Coordinator] Error receiving gradients: {e}")
+                    break
+            
+            if len(gradients_batch) != num_workers:
+                logger.warning(f"[Coordinator] Only received {len(gradients_batch)}/{num_workers} gradient sets")
+                continue
+            
+            # Average gradients
+            logger.info(f"[Coordinator] Aggregating gradients from {num_workers} workers")
+            aggregated_grads = {}
+            for key in gradients_batch[0].keys():
+                grads = [g[key] for g in gradients_batch if key in g]
+                if grads:
+                    aggregated_grads[key] = torch.stack(grads).mean(dim=0)
+            
+            # Apply aggregated gradients to shared model
+            shared_model.optimizer.zero_grad()
+            for name, param in shared_model.actor.named_parameters():
+                key = f'actor.{name}'
+                if key in aggregated_grads:
+                    param.grad = aggregated_grads[key].to(param.device)
+            
+            for name, param in shared_model.critic.named_parameters():
+                key = f'critic.{name}'
+                if key in aggregated_grads:
+                    param.grad = aggregated_grads[key].to(param.device)
+            
+            for name, param in shared_model.feature_extractor.named_parameters():
+                key = f'feature_extractor.{name}'
+                if key in aggregated_grads:
+                    param.grad = aggregated_grads[key].to(param.device)
+            
+            # Update parameters
+            shared_model.optimizer.step()
+            update_count += 1
+            
+            # Log aggregated metrics
+            avg_loss = np.mean([info['loss'] for info in loss_infos])
+            avg_pg_loss = np.mean([info['pg_loss'] for info in loss_infos])
+            avg_value_loss = np.mean([info['value_loss'] for info in loss_infos])
+            logger.info(
+                f"[Coordinator] Update {update_count}: "
+                f"loss={avg_loss:.4f}, pg_loss={avg_pg_loss:.4f}, value_loss={avg_value_loss:.4f}"
+            )
+            
+            # Signal workers that parameters are updated
+            param_update_event.set()
+            
+            # Wait for workers at barrier before next iteration
+            barrier.wait()
+            
+            # Periodically save shared model
+            if update_count % 10 == 0:
+                checkpoint_path = save_dir / f"shared_model_update_{update_count}.pt"
+                shared_model.save(str(checkpoint_path))
+                logger.info(f"[Coordinator] Saved shared model: {checkpoint_path.name}")
+                
+                # Manage checkpoint count
+                if max_checkpoints > 0:
+                    manage_checkpoints(save_dir, None, max_checkpoints, logger)
+    
+    except Exception as e:
+        logger.error(f"[Coordinator] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        logger.info("[Coordinator] Shutting down")
+
+
 def worker_process(
     worker_id: int,
     device_id: int,
     save_dir: Path,
     progress_queue: mp.Queue,
     stop_event: mp.Event,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    shared_model: Optional[PPOAgent] = None,
+    gradient_queue: Optional[mp.Queue] = None,
+    param_update_event: Optional[mp.Event] = None,
+    barrier: Optional[mp.Barrier] = None
 ):
     """
-    Worker process that trains a single agent independently.
+    Worker process that collects experiences and contributes gradients to shared model.
     
     Args:
         worker_id: Unique worker identifier
@@ -69,6 +219,10 @@ def worker_process(
         progress_queue: Queue for sending progress updates
         stop_event: Event to signal worker to stop
         config: Combined configuration dictionary
+        shared_model: Shared PPOAgent model (optional, for parameter sharing)
+        gradient_queue: Queue for sending gradients to coordinator
+        param_update_event: Event to signal parameters have been updated
+        barrier: Barrier for synchronizing workers
     """
     # Setup logging for this worker
     log_dir = save_dir / "logs"
@@ -229,12 +383,61 @@ def worker_process(
             # Update policy
             logger.info(f"Step {step}: Running PPO update...")
             update_start = time.time()
-            loss_info = agent.update(
-                last_obs=obs,
-                last_done=done,
-                n_epochs=ppo_epochs,
-                batch_size=minibatch_size
-            )
+            
+            # If using shared model, compute gradients and send to coordinator
+            if shared_model is not None and gradient_queue is not None:
+                # Compute gradients locally
+                loss_info = agent.compute_gradients(
+                    last_obs=obs,
+                    last_done=done,
+                    n_epochs=ppo_epochs,
+                    batch_size=minibatch_size
+                )
+                
+                # Extract gradients
+                gradients = {}
+                for name, param in agent.actor.named_parameters():
+                    if param.grad is not None:
+                        gradients[f'actor.{name}'] = param.grad.clone().cpu()
+                for name, param in agent.critic.named_parameters():
+                    if param.grad is not None:
+                        gradients[f'critic.{name}'] = param.grad.clone().cpu()
+                for name, param in agent.feature_extractor.named_parameters():
+                    if param.grad is not None:
+                        gradients[f'feature_extractor.{name}'] = param.grad.clone().cpu()
+                
+                # Send gradients to coordinator
+                gradient_queue.put({
+                    'worker_id': worker_id,
+                    'gradients': gradients,
+                    'loss_info': loss_info
+                })
+                
+                # Wait at barrier for all workers to submit gradients
+                if barrier is not None:
+                    logger.info("Waiting for other workers at gradient submission barrier...")
+                    barrier.wait()
+                
+                # Wait for parameter update
+                logger.info("Waiting for parameter update...")
+                param_update_event.wait()
+                param_update_event.clear()
+                
+                # Load updated parameters from shared model
+                agent.actor.load_state_dict(shared_model.actor.state_dict())
+                agent.critic.load_state_dict(shared_model.critic.state_dict())
+                agent.feature_extractor.load_state_dict(shared_model.feature_extractor.state_dict())
+                logger.info("Parameters updated from shared model")
+                
+            else:
+                # Independent training (original behavior)
+                loss_info = agent.update(
+                    last_obs=obs,
+                    last_done=done,
+                    n_epochs=ppo_epochs,
+                    batch_size=minibatch_size
+                )
+            
             update_time = time.time() - update_start
             logger.info(f"PPO update complete in {update_time:.2f}s")
             
@@ -276,6 +479,11 @@ def worker_process(
                 checkpoint_path = save_dir / f"worker_{worker_id}_step_{step}.pt"
                 agent.save(str(checkpoint_path))
                 logger.info(f"[OK] Checkpoint saved: {checkpoint_path.name}")
+                
+                # Manage checkpoint count
+                max_checkpoints = config['train_kwargs'].get('max_checkpoints', 0)
+                if max_checkpoints > 0:
+                    manage_checkpoints(save_dir, worker_id, max_checkpoints, logger)
         
         # Close progress bar
         pbar.close()
@@ -373,9 +581,69 @@ def main():
         'eval_kwargs': EVAL_KWARGS
     }
     
+    # Check if using shared model mode
+    use_shared_model = TRAIN_KWARGS.get("use_shared_model", True)
+    logger.info(f"[OK] Shared model training: {'enabled' if use_shared_model else 'disabled'}")
+    
     # Create communication channels
     progress_queue = mp.Queue()
     stop_event = mp.Event()
+    
+    # Shared model components (only if enabled)
+    shared_model = None
+    gradient_queue = None
+    param_update_event = None
+    barrier = None
+    coordinator = None
+    
+    if use_shared_model:
+        logger.info("="*80)
+        logger.info("INITIALIZING SHARED MODEL")
+        logger.info("="*80)
+        
+        # Create shared model (on GPU 0 if available)
+        device = 'cuda:0' if num_gpus > 0 else 'cpu'
+        logger.info(f"Creating shared model on {device}...")
+        
+        # Need to create a dummy environment to get observation space
+        from training.ge_environment import GrandExchangeEnv
+        dummy_env = GrandExchangeEnv(**ENV_KWARGS)
+        obs, _ = dummy_env.reset()
+        obs_dim = len(obs["price_data"].flatten()) + len(obs["portfolio"].flatten()) + len(obs["time_features"])
+        n_items = len(dummy_env.tradeable_items)
+        
+        shared_model = PPOAgent(
+            obs_dim=obs_dim,
+            n_items=n_items,
+            item_list=dummy_env.tradeable_items,
+            price_ranges=dummy_env.price_ranges,
+            buy_limits=dummy_env.buy_limits,
+            device=device,
+            **PPO_KWARGS
+        )
+        
+        # Share model parameters across processes
+        shared_model.actor.share_memory()
+        shared_model.critic.share_memory()
+        shared_model.feature_extractor.share_memory()
+        logger.info("[OK] Shared model created and moved to shared memory")
+        
+        # Create gradient coordination components
+        gradient_queue = mp.Queue()
+        param_update_event = mp.Event()
+        barrier = mp.Barrier(num_workers + 1)  # +1 for coordinator
+        
+        # Start gradient coordinator process
+        max_checkpoints = TRAIN_KWARGS.get('max_checkpoints', 0)
+        coordinator = mp.Process(
+            target=gradient_coordinator,
+            args=(num_workers, shared_model, gradient_queue, param_update_event, 
+                  barrier, stop_event, save_dir, setup_logger("Coordinator", str(log_dir / "coordinator.log")),
+                  max_checkpoints),
+            daemon=False
+        )
+        coordinator.start()
+        logger.info(f"[OK] Gradient coordinator started (PID: {coordinator.pid})")
     
     # Start worker processes
     logger.info("="*80)
@@ -395,7 +663,8 @@ def main():
         
         p = mp.Process(
             target=worker_process,
-            args=(worker_id, device_id, save_dir, progress_queue, stop_event, config),
+            args=(worker_id, device_id, save_dir, progress_queue, stop_event, config,
+                  shared_model, gradient_queue, param_update_event, barrier),
             daemon=False
         )
         p.start()
@@ -481,6 +750,22 @@ def main():
                 if p.is_alive():
                     logger.error(f"Worker {i} (PID: {p.pid}) still alive, killing...")
                     p.kill()
+    
+    # Stop coordinator if running
+    if coordinator is not None:
+        logger.info("Stopping gradient coordinator...")
+        stop_event.set()
+        coordinator.join(timeout=10)
+        if coordinator.is_alive():
+            logger.warning("Coordinator didn't stop gracefully, terminating...")
+            coordinator.terminate()
+        logger.info("[OK] Coordinator stopped")
+    
+    # Save final shared model if enabled
+    if use_shared_model and shared_model is not None:
+        final_model_path = save_dir / "shared_model_final.pt"
+        shared_model.save(str(final_model_path))
+        logger.info(f"[OK] Final shared model saved: {final_model_path.name}")
     
     # Final summary
     logger.info("="*80)
