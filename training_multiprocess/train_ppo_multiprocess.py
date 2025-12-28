@@ -104,9 +104,20 @@ def worker_process(
         # Create agent
         logger.info("Creating PPO agent...")
         ppo_kwargs = config['ppo_kwargs']
+        
+        # Construct price ranges and buy limits from environment data
+        price_ranges = {}
+        buy_limits = {}
+        for item_id in env.tradeable_items:
+            metadata = env.item_metadata.get(item_id, {})
+            # Use reasonable defaults based on typical OSRS item values
+            price_ranges[item_id] = (metadata.get('low_price', 100), metadata.get('high_price', 10000))
+            buy_limits[item_id] = metadata.get('buy_limit', 1000)
+        
         agent = PPOAgent(
-            observation_space=env.observation_space,
-            action_space=env.action_space,
+            item_list=env.tradeable_items,
+            price_ranges=price_ranges,
+            buy_limits=buy_limits,
             device=device,
             hidden_size=ppo_kwargs["hidden_size"],
             num_layers=ppo_kwargs["num_layers"],
@@ -119,10 +130,9 @@ def worker_process(
             price_bins=ppo_kwargs["price_bins"],
             quantity_bins=ppo_kwargs["quantity_bins"],
             wait_steps_bins=ppo_kwargs["wait_steps_bins"],
-            risk_tolerance=ppo_kwargs["risk_tolerance"],
-            buffer_size=ppo_kwargs["rollout_steps"]
+            buffer_size=ppo_kwargs["rollout_steps"],
+            agent_id=worker_id
         )
-        agent.agent_id = worker_id
         logger.info(f"Agent created with {agent.obs_dim} obs dim, {agent.n_items} items")
         
         # Training configuration
@@ -166,8 +176,17 @@ def worker_process(
                 # Get value estimate
                 value = agent.get_value(obs)
                 
+                # Convert action dict to numpy array format expected by environment
+                # Environment expects (n_items, 3) where each row is [action_type, item_idx, price]
+                # For single action agent, we create an array with one action at the selected item
+                action_array = np.zeros((len(env.tradeable_items), 3), dtype=np.float32)
+                if action_dict['type'] != 'hold':
+                    item_idx = action_dict['_item_idx']
+                    action_type = 1.0 if action_dict['type'] == 'buy' else 2.0  # 0=hold, 1=buy, 2=sell
+                    action_array[item_idx] = [action_type, action_dict['price'], action_dict['quantity']]
+                
                 # Step environment
-                next_obs, reward, terminated, truncated, info = env.step(action_dict)
+                next_obs, reward, terminated, truncated, info = env.step(action_array)
                 done = terminated or truncated
                 
                 # Store transition
