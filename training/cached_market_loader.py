@@ -4,13 +4,19 @@ Cached Market Data Loader
 
 Loads market data from JSON cache once and shares across all environments.
 Provides 10-100x faster environment initialization compared to database queries.
+
+MULTIPROCESSING SUPPORT:
+Uses multiprocessing.shared_memory to share cache across processes on all platforms
+(including Windows where fork() is not available).
 """
 
 import json
 import logging
+import pickle
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 
 logger = logging.getLogger("CachedMarketLoader")
 
@@ -42,14 +48,12 @@ class CachedMarketState:
     def mid_price(self) -> float:
         return (self.high_price + self.low_price) / 2
 
-
-class CachedMarketData:
-    """
-    Global market data cache loaded once and shared across all environments.
-    Thread-safe for read-only access.
+    Supports true shared memory across processes using multiprocessing.shared_memory.
     """
     _instance: Optional['CachedMarketData'] = None
     _loaded: bool = False
+    _shared_memory: Optional[shared_memory.SharedMemory] = None
+    _shm_name: Optional[str] = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -64,22 +68,24 @@ class CachedMarketData:
             self.timestamps: List[int] = []
             self.item_ids: List[int] = []
             self.metadata: Dict = {}
-    
-    def load(self, cache_file: str = "training_cache.json", force_reload: bool = False):
+            self._is_shared_memory = Falseall load() to populate."""
+        if not self._loaded:
+            self.items: Dict[int, Dict] = {}
+            self.market_history: Dict[int, List[CachedMarketState]] = {}, use_shared_memory: bool = True):
         """
         Load market data from JSON cache file.
         
         MULTIPROCESSING OPTIMIZATION:
-        When loaded in parent process before spawning child processes,
-        the cache data is shared via copy-on-write memory, allowing
-        all agents to share the same 2.4GB cache without duplication.
+        When use_shared_memory=True, stores cache in shared memory that all
+        processes can access without duplication. Works on Windows and Unix.
         
         Args:
             cache_file: Path to JSON cache file
             force_reload: Force reload even if already loaded
+            use_shared_memory: Use shared memory for multiprocessing (recommended)
         """
         if self._loaded and not force_reload:
-            logger.info("Cache already loaded, skipping reload (shared memory)")
+            logger.info("Cache already loaded, skipping reload")
             return
         
         cache_path = Path(cache_file)
@@ -122,9 +128,116 @@ class CachedMarketData:
                 for point in history
             ]
         
+        # Store in shared memory if requested
+        if use_shared_memory:
+            self._store_in_shared_memory()
+        
         self._loaded = True
         
         file_size_mb = cache_path.stat().st_size / (1024 * 1024)
+        logger.info(f"✓ Cache loaded: {file_size_mb:.2f} MB")
+        logger.info(f"  Items: {len(self.items)}")
+        logger.info(f"  Timestamps: {len(self.timestamps)}")
+        logger.info(f"  Time range: {self.metadata.get('time_range', 'unknown')}")
+        logger.info(f"  Total data points: {sum(len(h) for h in self.market_history.values())}")
+        if self._is_shared_memory:
+            logger.info(f"  ✓ Stored in shared memory (name: {self._shm_name})")
+    
+    def _store_in_shared_memory(self):
+        """Store cache data in shared memory for multiprocessing."""
+        try:
+            # Pickle the cache data
+            cache_data = {
+                'metadata': self.metadata,
+                'items': self.items,
+                'timestamps': self.timestamps,
+                'item_ids': self.item_ids,
+                'market_history': self.market_history
+            }
+            pickled_data = pickle.dumps(cache_data)
+            data_size = len(pickled_data)
+            
+            # Create shared memory block
+            self._shared_memory = shared_memory.SharedMemory(create=True, size=data_size)
+            self._shm_name = self._shared_memory.name
+            
+            # Copy data to shared memory
+            self._shared_memory.buf[:data_size] = pickled_data
+            
+            self._is_shared_memory = True
+            logger.info(f"Cache stored in shared memory: {data_size / (1024*1024):.1f} MB")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create shared memory, using regular memory: {e}")
+            self._is_shared_memory = False
+    
+    def load_from_shared_memory(self, shm_name: str):
+        """Load cache from existing shared memory (called by child processes)."""
+        if self._loaded:
+            logger.info("Cache already loaded")
+            return
+        
+        try:
+            # Attach to existing shared memory
+            shm = shared_memory.SharedMemory(name=shm_name)
+            
+            # Read and unpickle data
+            pickled_data = bytes(shm.buf[:]), use_shared_memory: bool = True):
+    """
+    Load the global market data cache.
+    
+    Args:
+        cache_file: Path to JSON cache file
+        force_reload: Force reload even if already loaded
+        use_shared_memory: Use shared memory for multiprocessing (recommended)
+    """
+    _CACHE.load(cache_file, force_reload, use_shared_memory)
+
+
+def load_cache_from_shared_memory(shm_name: str):
+    """
+    Load cache from existing shared memory (for child processes).
+    
+    Args:
+        shm_name: Shared memory block name from parent process
+    """
+    _CACHE.load_from_shared_memory(shm_name)
+
+
+def get_shared_memory_name() -> Optional[str]:
+    """Get shared memory name for passing to child processes."""
+    return _CACHE.get_shared_memory_name()
+
+
+def cleanup_shared_memory():
+    """Cleanup shared memory (call in parent process at exit)."""
+    _CACHE.cleanup_shared_memory(data['market_history']
+            
+            self._shared_memory = shm
+            self._shm_name = shm_name
+            self._is_shared_memory = True
+            self._loaded = True
+            
+            logger.info(f"✓ Loaded cache from shared memory: {shm_name}")
+            logger.info(f"  Items: {len(self.items)}, Timestamps: {len(self.timestamps)}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load from shared memory: {e}")
+            raise
+    
+    def get_shared_memory_name(self) -> Optional[str]:
+        """Get the shared memory name for passing to child processes."""
+        return self._shm_name if self._is_shared_memory else None
+    
+    def cleanup_shared_memory(self):
+        """Cleanup shared memory (call this in parent process at exit)."""
+        if self._shared_memory is not None:
+            try:
+                self._shared_memory.close()
+                self._shared_memory.unlink()
+                logger.info("Shared memory cleaned up")
+            except Exception as e:
+                logger.warning(f"Error cleaning up shared memory: {e
         logger.info(f"✓ Cache loaded: {file_size_mb:.2f} MB")
         logger.info(f"  Items: {len(self.items)}")
         logger.info(f"  Timestamps: {len(self.timestamps)}")

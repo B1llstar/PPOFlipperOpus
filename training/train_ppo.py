@@ -1264,12 +1264,22 @@ def main():
     logger.info("Generated tax report in tax_log.txt")
 
 # Multiprocessing structure for concurrent agent training
-def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, ppo_kwargs, use_historical_data=False, volume_analyzer=None):
+def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, ppo_kwargs, use_historical_data=False, volume_analyzer=None, shm_name=None):
     logger = setup_logger(log_queue)
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from api.ge_rest_client import GrandExchangeClient, HistoricalGrandExchangeClient
+    
+    # Load cache from shared memory if available (WINDOWS COMPATIBLE)
+    if shm_name:
+        from training.cached_market_loader import load_cache_from_shared_memory
+        logger.info(f"Agent {agent_idx}: Loading cache from shared memory: {shm_name}")
+        try:
+            load_cache_from_shared_memory(shm_name)
+            logger.info(f"Agent {agent_idx}: ✓ Cache loaded from shared memory")
+        except Exception as e:
+            logger.error(f"Agent {agent_idx}: Failed to load from shared memory: {e}")
     
     # Create name-to-id and id-to-name mappings
     id_name_map, _ = read_mapping_file()
@@ -3087,14 +3097,20 @@ if __name__ == "__main__":
         listener = start_logging_listener(log_queue)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # PRE-LOAD CACHE IN PARENT PROCESS (shared via copy-on-write in child processes)
-        # This loads the 2.4GB cache ONCE instead of per-agent
+        # PRE-LOAD CACHE IN PARENT PROCESS WITH SHARED MEMORY
+        # This loads the 2.4GB cache ONCE into shared memory that all agents access
         cache_file = ENV_KWARGS.get("cache_file", "training_cache.json")
+        shm_name = None
         if cache_file:
-            from training.cached_market_loader import load_cache
-            logger.info(f"Pre-loading shared cache: {cache_file}")
-            load_cache(cache_file)
-            logger.info("✓ Cache loaded in parent process - will be shared across all agents via copy-on-write")
+            from training.cached_market_loader import load_cache, get_shared_memory_name, cleanup_shared_memory
+            logger.info(f"Loading cache into shared memory: {cache_file}")
+            load_cache(cache_file, use_shared_memory=True)
+            shm_name = get_shared_memory_name()
+            if shm_name:
+                logger.info(f"✓ Cache loaded in shared memory: {shm_name}")
+                logger.info("  All agents will access this shared memory (zero duplication)")
+            else:
+                logger.warning("Shared memory not available, agents will load cache individually")
         
         # Load all data from training cache (NO API CALLS)
         id_name_map, buy_limits_map, marketplace_data, volume_data_5m, volume_data_1h = load_training_cache()
@@ -3115,16 +3131,24 @@ if __name__ == "__main__":
         logger.info(f"Initialized volume analyzer with {len(volume_data_5m)} 5m items and {len(volume_data_1h)} 1h items from cache")
         processes = []
         NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
-        logger.info(f"Starting {NUM_AGENTS} parallel agent workers with shared cache")
-        for agent_idx in range(NUM_AGENTS):
-            p = multiprocessing.Process(
-                target=agent_worker,
-                args=(agent_idx, log_queue, items, price_ranges, buy_limits, device, PPO_KWARGS, True, volume_analyzer)
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+        logger.info(f"Starting {NUM_AGENTS} parallel agent workers with shared memory cache")
+        
+        try:
+            for agent_idx in range(NUM_AGENTS):
+                p = multiprocessing.Process(
+                    target=agent_worker,
+                    args=(agent_idx, log_queue, items, price_ranges, buy_limits, device, PPO_KWARGS, True, volume_analyzer, shm_name)
+                )
+                p.start()
+                processes.append(p)
+            for p in processes:
+                p.join()
+        finally:
+            # Cleanup shared memory when done
+            if shm_name:
+                cleanup_shared_memory()
+                logger.info("Shared memory cleaned up")
+        
         listener.stop()
     else:
         main()
