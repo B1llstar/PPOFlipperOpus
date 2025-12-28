@@ -448,10 +448,12 @@ def main():
     # Use cached 1h volume data
     volume_data = volume_data_1h
     
-    # Create id_to_name_map early for use below
+    # Create id_to_name_map and name_to_id_map early for use below
     id_to_name_map = {}
+    name_to_id_map = {}
     for item_id, item_name in id_name_map.items():
         id_to_name_map[item_id] = item_name
+        name_to_id_map[item_name] = item_id
     
     # Calculate total volume for each item immediately after building the dictionary
     item_volumes = {}
