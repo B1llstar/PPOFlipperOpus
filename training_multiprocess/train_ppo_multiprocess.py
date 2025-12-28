@@ -118,13 +118,21 @@ def gradient_coordinator(
     
     try:
         while not stop_event.is_set():
+            # Wait at barrier for all workers to submit gradients
+            logger.info("[Coordinator] Waiting at barrier for workers to submit gradients...")
+            try:
+                barrier.wait(timeout=120)
+            except Exception as e:
+                logger.error(f"[Coordinator] Barrier wait failed: {e}")
+                break
+            
             # Collect gradients from all workers
             gradients_batch = []
             loss_infos = []
             
             for _ in range(num_workers):
                 try:
-                    grad_data = gradient_queue.get(timeout=60)
+                    grad_data = gradient_queue.get(timeout=5)
                     gradients_batch.append(grad_data['gradients'])
                     loss_infos.append(grad_data['loss_info'])
                 except Exception as e:
@@ -175,9 +183,7 @@ def gradient_coordinator(
             
             # Signal workers that parameters are updated
             param_update_event.set()
-            
-            # Wait for workers at barrier before next iteration
-            barrier.wait()
+            logger.info("[Coordinator] Parameters updated, signaled workers")
             
             # Periodically save shared model
             if update_count % 10 == 0:
@@ -412,16 +418,18 @@ def worker_process(
                     'gradients': gradients,
                     'loss_info': loss_info
                 })
+                logger.info("Gradients sent to coordinator")
                 
                 # Wait at barrier for all workers to submit gradients
                 if barrier is not None:
-                    logger.info("Waiting for other workers at gradient submission barrier...")
+                    logger.info("Waiting at barrier for all workers...")
                     barrier.wait()
+                    logger.info("Barrier passed, waiting for parameter update...")
                 
-                # Wait for parameter update
-                logger.info("Waiting for parameter update...")
+                # Wait for parameter update from coordinator
                 param_update_event.wait()
                 param_update_event.clear()
+                logger.info("Parameter update event received")
                 
                 # Load updated parameters from shared model
                 agent.actor.load_state_dict(shared_model.actor.state_dict())
@@ -605,22 +613,38 @@ def main():
         device = 'cuda:0' if num_gpus > 0 else 'cpu'
         logger.info(f"Creating shared model on {device}...")
         
-        # Need to create a dummy environment to get observation space
+        # Need to create a dummy environment to get item metadata
         from training.ge_environment import GrandExchangeEnv
         dummy_env = GrandExchangeEnv(**ENV_KWARGS)
-        obs, _ = dummy_env.reset()
-        obs_dim = len(obs["price_data"].flatten()) + len(obs["portfolio"].flatten()) + len(obs["time_features"])
-        n_items = len(dummy_env.tradeable_items)
+        
+        # Construct price ranges and buy limits from environment data
+        price_ranges = {}
+        buy_limits = {}
+        for item_id in dummy_env.tradeable_items:
+            metadata = dummy_env.item_metadata.get(item_id, {})
+            price_ranges[item_id] = (metadata.get('low_price', 100), metadata.get('high_price', 10000))
+            buy_limits[item_id] = metadata.get('buy_limit', 1000)
         
         shared_model = PPOAgent(
-            obs_dim=obs_dim,
-            n_items=n_items,
             item_list=dummy_env.tradeable_items,
-            price_ranges=dummy_env.price_ranges,
-            buy_limits=dummy_env.buy_limits,
+            price_ranges=price_ranges,
+            buy_limits=buy_limits,
             device=device,
-            **PPO_KWARGS
+            hidden_size=PPO_KWARGS["hidden_size"],
+            num_layers=PPO_KWARGS["num_layers"],
+            lr=PPO_KWARGS["lr"],
+            gamma=PPO_KWARGS["gamma"],
+            gae_lambda=PPO_KWARGS["gae_lambda"],
+            clip_epsilon=PPO_KWARGS["clip_epsilon"],
+            entropy_coef=PPO_KWARGS["entropy_coef"],
+            value_coef=PPO_KWARGS["value_coef"],
+            price_bins=PPO_KWARGS["price_bins"],
+            quantity_bins=PPO_KWARGS["quantity_bins"],
+            wait_steps_bins=PPO_KWARGS["wait_steps_bins"],
+            buffer_size=PPO_KWARGS["rollout_steps"],
+            agent_id=0  # Shared model is agent 0
         )
+        logger.info(f"[OK] Shared model created: obs_dim={shared_model.obs_dim}, n_items={shared_model.n_items}")
         
         # Share model parameters across processes
         shared_model.actor.share_memory()
