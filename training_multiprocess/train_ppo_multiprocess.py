@@ -68,7 +68,8 @@ def manage_checkpoints(save_dir: Path, worker_id: int, max_checkpoints: int, log
     if worker_id is not None:
         pattern = f"worker_{worker_id}_step_*.pt"
     else:
-        pattern = "shared_model_update_*.pt"
+        # Match both old and new checkpoint formats
+        pattern = "shared_model_step_*.pt"
     
     checkpoints = list(save_dir.glob(pattern))
     
@@ -88,6 +89,56 @@ def manage_checkpoints(save_dir: Path, worker_id: int, max_checkpoints: int, log
             logger.warning(f"Failed to delete checkpoint {checkpoint.name}: {e}")
 
 
+def find_latest_checkpoint(save_dir: Path, logger: logging.Logger) -> Optional[Path]:
+    """
+    Find the most recent shared model checkpoint.
+    
+    Args:
+        save_dir: Directory containing checkpoints
+        logger: Logger instance
+        
+    Returns:
+        Path to latest checkpoint or None if none found
+    """
+    # Check for final checkpoint first
+    final_checkpoint = save_dir / "shared_model_final.pt"
+    if final_checkpoint.exists():
+        logger.info(f"Found final checkpoint: {final_checkpoint.name}")
+        return final_checkpoint
+    
+    # Look for step-based checkpoints (new format)
+    step_checkpoints = list(save_dir.glob("shared_model_step_*.pt"))
+    
+    if step_checkpoints:
+        # Parse step numbers from filenames and find the highest
+        def get_step_number(path: Path) -> int:
+            try:
+                # Extract number from "shared_model_step_12345.pt"
+                return int(path.stem.split('_')[-1])
+            except:
+                return -1
+        
+        # Sort by step number (highest first)
+        step_checkpoints.sort(key=get_step_number, reverse=True)
+        latest = step_checkpoints[0]
+        step_num = get_step_number(latest)
+        logger.info(f"Found latest checkpoint: {latest.name} (step {step_num})")
+        return latest
+    
+    # Look for update-based checkpoints (old format, for backward compatibility)
+    update_checkpoints = list(save_dir.glob("shared_model_update_*.pt"))
+    
+    if update_checkpoints:
+        # Sort by modification time (newest first)
+        update_checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        latest = update_checkpoints[0]
+        logger.info(f"Found latest checkpoint: {latest.name}")
+        return latest
+    
+    logger.info("No existing checkpoints found - starting fresh")
+    return None
+
+
 def gradient_coordinator(
     num_workers: int,
     shared_model: PPOAgent,
@@ -97,7 +148,9 @@ def gradient_coordinator(
     stop_event: mp.Event,
     save_dir: Path,
     logger: logging.Logger,
-    max_checkpoints: int = 0
+    max_checkpoints: int = 0,
+    initial_update_count: int = 0,
+    initial_timesteps: int = 0
 ):
     """
     Coordinator process that aggregates gradients from workers and updates shared model.
@@ -112,9 +165,22 @@ def gradient_coordinator(
         save_dir: Directory for saving coordinated checkpoints
         logger: Logger instance
         max_checkpoints: Maximum number of checkpoints to keep (0 = unlimited)
+        initial_update_count: Starting update count (for resumed training)
+        initial_timesteps: Starting timestep count (for resumed training)
     """
     logger.info("[Coordinator] Starting gradient coordinator")
-    update_count = 0
+    if initial_timesteps > 0:
+        logger.info(f"[Coordinator] *** RESUMING TRAINING ***")
+        logger.info(f"[Coordinator] Starting from step {initial_timesteps} (update {initial_update_count})")
+    else:
+        logger.info(f"[Coordinator] Starting fresh training from step 0")
+    
+    update_count = initial_update_count
+    total_timesteps = initial_timesteps
+    
+    # Initialize shared model tracking (important for first save)
+    shared_model.n_updates = update_count
+    shared_model.total_timesteps = total_timesteps
     
     try:
         while not stop_event.is_set():
@@ -129,12 +195,14 @@ def gradient_coordinator(
             # Collect gradients from all workers
             gradients_batch = []
             loss_infos = []
+            total_steps_this_update = 0
             
             for _ in range(num_workers):
                 try:
                     grad_data = gradient_queue.get(timeout=5)
                     gradients_batch.append(grad_data['gradients'])
                     loss_infos.append(grad_data['loss_info'])
+                    total_steps_this_update += grad_data.get('steps', 0)
                 except Exception as e:
                     logger.error(f"[Coordinator] Error receiving gradients: {e}")
                     break
@@ -171,6 +239,11 @@ def gradient_coordinator(
             # Update parameters
             shared_model.optimizer.step()
             update_count += 1
+            total_timesteps += total_steps_this_update
+            
+            # Update shared model tracking variables BEFORE saving
+            shared_model.n_updates = update_count
+            shared_model.total_timesteps = total_timesteps
             
             # Log aggregated metrics
             avg_loss = np.mean([info['loss'] for info in loss_infos])
@@ -179,7 +252,8 @@ def gradient_coordinator(
             logger.info(
                 f"[Coordinator] Update {update_count}: "
                 f"SHARED MODEL UPDATED - "
-                f"loss={avg_loss:.4f}, pg_loss={avg_pg_loss:.4f}, value_loss={avg_value_loss:.4f}"
+                f"loss={avg_loss:.4f}, pg_loss={avg_pg_loss:.4f}, value_loss={avg_value_loss:.4f}, "
+                f"total_steps={total_timesteps}"
             )
             
             # Signal workers that parameters are updated
@@ -188,9 +262,9 @@ def gradient_coordinator(
             
             # Save shared model checkpoint periodically
             if update_count % 5 == 0:  # Save every 5 updates
-                checkpoint_path = save_dir / f"shared_model_update_{update_count}.pt"
+                checkpoint_path = save_dir / f"shared_model_step_{total_timesteps}.pt"
                 shared_model.save(str(checkpoint_path))
-                logger.info(f"[Coordinator] ✓ SHARED MODEL CHECKPOINT SAVED: {checkpoint_path.name}")
+                logger.info(f"[Coordinator] ✓ SHARED MODEL CHECKPOINT SAVED: {checkpoint_path.name} (steps={total_timesteps}, updates={update_count})")
                 
                 # Manage checkpoint count
                 if max_checkpoints > 0:
@@ -417,7 +491,8 @@ def worker_process(
                 gradient_queue.put({
                     'worker_id': worker_id,
                     'gradients': gradients,
-                    'loss_info': loss_info
+                    'loss_info': loss_info,
+                    'steps': rollout_steps  # Steps collected in this rollout
                 })
                 logger.info("Gradients sent to coordinator")
                 
@@ -649,7 +724,40 @@ def main():
             buffer_size=PPO_KWARGS["rollout_steps"],
             agent_id=0  # Shared model is agent 0
         )
+        
+        # Check for existing checkpoint to resume training
+        latest_checkpoint = find_latest_checkpoint(save_dir, logger)
+        initial_update_count = 0
+        initial_timesteps = 0
+        
+        if latest_checkpoint is not None:
+            logger.info("="*80)
+            logger.info(f"RESUMING FROM CHECKPOINT: {latest_checkpoint.name}")
+            logger.info(f"Full path: {latest_checkpoint}")
+            logger.info("="*80)
+            try:
+                logger.info(f"Loading checkpoint file: {latest_checkpoint}")
+                checkpoint_data = torch.load(latest_checkpoint, map_location=device)
+                shared_model.feature_extractor.load_state_dict(checkpoint_data["feature_extractor"])
+                shared_model.actor.load_state_dict(checkpoint_data["actor"])
+                shared_model.critic.load_state_dict(checkpoint_data["critic"])
+                shared_model.optimizer.load_state_dict(checkpoint_data["optimizer"])
+                shared_model.n_updates = checkpoint_data.get("n_updates", 0)
+                shared_model.total_timesteps = checkpoint_data.get("total_timesteps", 0)
+                initial_update_count = shared_model.n_updates
+                initial_timesteps = shared_model.total_timesteps
+                logger.info(f"✓ Checkpoint loaded successfully from {latest_checkpoint.name}")
+                logger.info(f"  Previous updates: {shared_model.n_updates}")
+                logger.info(f"  Previous timesteps: {shared_model.total_timesteps}")
+                logger.info(f"  Resuming from step {initial_timesteps}")
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}")
+                logger.warning("Starting fresh training instead")
+                initial_update_count = 0
+                initial_timesteps = 0
+        
         logger.info(f"[OK] Shared model created: obs_dim={shared_model.obs_dim}, n_items={shared_model.n_items}")
+        logger.info(f"[OK] Training will start from step {initial_timesteps}")
         
         # Share model parameters across processes
         shared_model.actor.share_memory()
@@ -668,7 +776,7 @@ def main():
             target=gradient_coordinator,
             args=(num_workers, shared_model, gradient_queue, param_update_event, 
                   barrier, stop_event, save_dir, setup_logger("Coordinator", str(log_dir / "coordinator.log")),
-                  max_checkpoints),
+                  max_checkpoints, initial_update_count, initial_timesteps),
             daemon=False
         )
         coordinator.start()
