@@ -10,7 +10,7 @@ ENV_KWARGS = {
     "cache_file": "training_cache.json",  # JSON file containing cached historical price data
     "initial_cash": 1_000_000,  # Starting capital (gp) for each trading episode
     "episode_length": 864,  # Number of time steps per episode (864 = 3 days at 5min intervals)
-    "top_n_items": 20,  # Maximum number of items to include (effectively unlimited)
+    "top_n_items": 999_999_999,  # Maximum number of items to include (effectively unlimited)
 }
 
 # PPO Agent Configuration
@@ -35,8 +35,8 @@ PPO_KWARGS = {
 # Training Configuration
 TRAIN_KWARGS = {
     # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, safe buffer)
-    "num_workers": 2,  # Number of parallel environment workers for data collection
-    "max_steps_per_worker": 10_000_000,  # Maximum training steps per worker (10M total)
+    "num_workers": 20,  # Number of parallel environment workers for data collection
+    "max_steps_per_worker": 5120,  # Maximum training steps per worker (10M total)
     "save_every_steps": 100,  # Save model checkpoint every N steps
     "log_every_steps": 1_000,  # Log training metrics (loss, rewards) every N steps
     "eval_every_steps": 25_000,  # Run evaluation episodes every N steps
