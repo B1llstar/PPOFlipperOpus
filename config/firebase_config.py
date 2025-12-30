@@ -76,6 +76,9 @@ MAX_ACTIVE_ORDERS = 8
 # Maximum pending orders before blocking new submissions
 MAX_PENDING_ORDERS = 8
 
+# Maximum number of outstanding positions (different items held)
+MAX_OUTSTANDING_POSITIONS = 25
+
 # Minimum confidence threshold to execute a trade
 MIN_CONFIDENCE_THRESHOLD = 0.7
 
@@ -151,6 +154,7 @@ FIREBASE_CONFIG = {
     # Trading Limits
     "max_active_orders": MAX_ACTIVE_ORDERS,
     "max_pending_orders": MAX_PENDING_ORDERS,
+    "max_outstanding_positions": MAX_OUTSTANDING_POSITIONS,
     "min_confidence_threshold": MIN_CONFIDENCE_THRESHOLD,
     "max_order_value": MAX_ORDER_VALUE,
     "min_order_value": MIN_ORDER_VALUE,

@@ -8,6 +8,9 @@ GE Auto plugin.
 Architecture:
     PPO Inference → Firebase → GE Auto Plugin
     PPO Inference ← Firebase ← GE Auto Plugin
+
+Now uses trained PPO model (shared_model_final.pt) for actual decision making
+with the top 200 traded items from training data.
 """
 
 import asyncio
@@ -15,8 +18,14 @@ import logging
 import signal
 import sys
 import time
+import os
+import json
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
+
+import torch
+import numpy as np
 
 # Set up logging
 logging.basicConfig(
@@ -41,6 +50,7 @@ try:
         DECISION_INTERVAL,
         MIN_CONFIDENCE_THRESHOLD,
         MAX_ACTIVE_ORDERS,
+        MAX_OUTSTANDING_POSITIONS,
         get_config
     )
     logger.info("Successfully imported Firebase components")
@@ -114,36 +124,29 @@ class FirebaseInferenceRunner:
             "last_decision_time": None
         }
 
-        # Item data - Only trade runes
+        # Item data - loaded from trained model
         self.tradeable_items: Dict[int, str] = {}  # item_id -> name
         self.id_to_name_map: Dict[str, str] = {}
         self.name_to_id_map: Dict[str, str] = {}
         self.buy_limits: Dict[str, int] = {}
 
-        # Magic runes we trade
-        self.RUNES = {
-            554: "Fire rune",
-            555: "Water rune",
-            556: "Air rune",
-            557: "Earth rune",
-            558: "Mind rune",
-            559: "Body rune",
-            560: "Death rune",
-            561: "Nature rune",
-            562: "Chaos rune",
-            563: "Law rune",
-            564: "Cosmic rune",
-            565: "Blood rune",
-            566: "Soul rune",
-            9075: "Astral rune",
-            21880: "Wrath rune",
-            4694: "Steam rune",
-            4695: "Mist rune",
-            4696: "Dust rune",
-            4697: "Smoke rune",
-            4698: "Mud rune",
-            4699: "Lava rune",
-        }
+        # Model data - loaded from checkpoint
+        self.item_list: List[int] = []  # List of item IDs from training
+        self.price_ranges: Dict[int, Tuple[float, float]] = {}
+        self.model_buy_limits: Dict[int, int] = {}
+        self.model_config: Dict[str, Any] = {}
+
+        # PPO model components
+        self.feature_extractor = None
+        self.actor = None
+        self.critic = None
+        self.device = None
+
+        # Market data cache (to avoid hitting API too frequently)
+        self._market_data_cache: Optional[Dict[str, Any]] = None
+        self._market_data_cache_time: float = 0
+        self._market_data_cache_ttl: float = 60.0  # Cache for 60 seconds
+        self._ge_client = None  # Reusable API client
 
     # =========================================================================
     # Initialization
@@ -162,61 +165,167 @@ class FirebaseInferenceRunner:
                 on_order_status_changed=self._on_order_status_changed
             )
 
-            # Load item data
-            self._load_item_data()
+            # Initialize PPO agent first (loads model and item_list)
+            if not self._initialize_agent():
+                logger.error("Failed to initialize PPO agent")
+                return False
 
-            # Initialize PPO agent (if available)
-            self._initialize_agent()
+            # Load item data (uses item_list from model)
+            self._load_item_data()
 
             logger.info("Firebase inference runner initialized successfully")
             return True
 
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _load_item_data(self):
-        """Load rune data for trading."""
-        logger.info("Loading rune data for trading...")
+        """Load item data from mongo_data/items.json for the trained items."""
+        logger.info("Loading item data for trading...")
 
-        # Use only the predefined runes
-        self.tradeable_items = self.RUNES.copy()
+        # Get the base directory (parent of inference/)
+        base_dir = Path(__file__).parent.parent
 
-        for item_id, item_name in self.RUNES.items():
-            self.id_to_name_map[str(item_id)] = item_name
-            self.name_to_id_map[item_name] = str(item_id)
-            # Runes have high buy limits
-            self.buy_limits[item_name] = 25000
+        # Load item mapping from mongo_data/items.json
+        items_path = base_dir / "mongo_data" / "items.json"
+        try:
+            with open(items_path, 'r') as f:
+                items_data = json.load(f)
 
-        logger.info(f"Loaded {len(self.tradeable_items)} runes for trading:")
-        for item_id, name in sorted(self.tradeable_items.items()):
-            logger.info(f"  {item_id}: {name}")
+            # Build ID to name mapping
+            all_items_map = {}
+            for item in items_data:
+                item_id = item.get('id')
+                item_name = item.get('name')
+                ge_limit = item.get('ge_limit', 5000)
+                if item_id and item_name:
+                    all_items_map[item_id] = {
+                        'name': item_name,
+                        'ge_limit': ge_limit if ge_limit else 5000
+                    }
+
+            logger.info(f"Loaded {len(all_items_map)} items from items.json")
+
+        except FileNotFoundError:
+            logger.error(f"Items file not found: {items_path}")
+            all_items_map = {}
+        except Exception as e:
+            logger.error(f"Error loading items: {e}")
+            all_items_map = {}
+
+        # Filter to only the items from training (self.item_list is loaded from model)
+        for item_id in self.item_list:
+            if item_id in all_items_map:
+                item_info = all_items_map[item_id]
+                item_name = item_info['name']
+                ge_limit = item_info['ge_limit']
+
+                self.tradeable_items[item_id] = item_name
+                self.id_to_name_map[str(item_id)] = item_name
+                self.name_to_id_map[item_name] = str(item_id)
+                self.buy_limits[item_name] = ge_limit
+            else:
+                # Use item ID as name if not found in mapping
+                logger.warning(f"Item ID {item_id} not found in items.json")
+                self.tradeable_items[item_id] = f"Item_{item_id}"
+                self.id_to_name_map[str(item_id)] = f"Item_{item_id}"
+                self.name_to_id_map[f"Item_{item_id}"] = str(item_id)
+                self.buy_limits[f"Item_{item_id}"] = 5000
+
+        logger.info(f"Loaded {len(self.tradeable_items)} items for trading (from model training)")
+        logger.info(f"First 10 items: {list(self.tradeable_items.items())[:10]}")
 
     def _initialize_agent(self):
-        """Initialize the PPO agent."""
+        """Initialize the PPO agent by loading the trained model."""
         logger.info("Initializing PPO agent...")
 
+        # Get the base directory
+        base_dir = Path(__file__).parent.parent
+        model_path = base_dir / "model" / "shared_model_final.pt"
+
+        if not model_path.exists():
+            logger.error(f"Model file not found: {model_path}")
+            return False
+
         try:
-            # Try to load a trained agent
-            # For now, we'll create a placeholder that can be replaced
-            # with actual agent loading logic
-
-            # Check for trained model
-            import os
-            model_path = os.path.join(
-                os.path.dirname(__file__),
-                "..", "models", "ppo_agent.pt"
-            )
-
-            if os.path.exists(model_path):
-                logger.info(f"Loading trained model from {model_path}")
-                # TODO: Load actual trained model
-                # self.agent = PPOAgent.load(model_path)
+            # Determine the best device
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                logger.info("Using Apple Silicon MPS")
             else:
-                logger.warning("No trained model found, using mock decision maker")
+                self.device = torch.device("cpu")
+                logger.info("Using CPU")
+
+            # Load the checkpoint
+            logger.info(f"Loading trained model from {model_path}")
+            checkpoint = torch.load(model_path, map_location=self.device)
+
+            # Extract model metadata
+            self.item_list = checkpoint.get('item_list', [])
+            self.price_ranges = checkpoint.get('price_ranges', {})
+            self.model_buy_limits = checkpoint.get('buy_limits', {})
+            self.model_config = checkpoint.get('config', {})
+
+            logger.info(f"Model trained on {len(self.item_list)} items")
+            logger.info(f"Model config: hidden_size={self.model_config.get('hidden_size')}, "
+                       f"num_layers={self.model_config.get('num_layers')}, "
+                       f"obs_dim={self.model_config.get('obs_dim')}")
+
+            # Import network components from ppo_agent
+            from ppo_agent import FeatureExtractor, ActorHead, CriticHead
+
+            # Create network components with the same architecture as training
+            hidden_size = self.model_config.get('hidden_size', 256)
+            num_layers = self.model_config.get('num_layers', 3)
+            obs_dim = self.model_config.get('obs_dim', 1407)
+            n_items = self.model_config.get('n_items', 200)
+            price_bins = self.model_config.get('price_bins', 21)
+            quantity_bins = self.model_config.get('quantity_bins', 11)
+            wait_steps_bins = self.model_config.get('wait_steps_bins', 5)
+
+            self.feature_extractor = FeatureExtractor(
+                input_dim=obs_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers
+            ).to(self.device)
+
+            self.actor = ActorHead(
+                feature_dim=hidden_size,
+                n_items=n_items,
+                price_bins=price_bins,
+                quantity_bins=quantity_bins,
+                wait_steps_bins=wait_steps_bins
+            ).to(self.device)
+
+            self.critic = CriticHead(feature_dim=hidden_size).to(self.device)
+
+            # Load the trained weights
+            self.feature_extractor.load_state_dict(checkpoint['feature_extractor'])
+            self.actor.load_state_dict(checkpoint['actor'])
+            self.critic.load_state_dict(checkpoint['critic'])
+
+            # Set to evaluation mode
+            self.feature_extractor.eval()
+            self.actor.eval()
+            self.critic.eval()
+
+            logger.info(f"Successfully loaded trained PPO model")
+            logger.info(f"Model has been updated {checkpoint.get('n_updates', 0)} times, "
+                       f"trained on {checkpoint.get('total_timesteps', 0)} timesteps")
+
+            return True
 
         except Exception as e:
-            logger.warning(f"Could not initialize PPO agent: {e}")
+            logger.error(f"Failed to load PPO model: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     # =========================================================================
     # Lifecycle
@@ -335,6 +444,13 @@ class FirebaseInferenceRunner:
             logger.debug(f"Max active orders reached ({active_count})")
             return
 
+        # Check outstanding positions limit (number of different items held)
+        positions_count = len([h for h in holdings.values()
+                              if isinstance(h, dict) and h.get('quantity', 0) > 0])
+        if positions_count >= MAX_OUTSTANDING_POSITIONS:
+            logger.debug(f"Max outstanding positions reached ({positions_count}/{MAX_OUTSTANDING_POSITIONS})")
+            return
+
         # Get market data for decision making
         market_data = await self._get_market_data()
 
@@ -366,51 +482,206 @@ class FirebaseInferenceRunner:
             logger.debug("Decision: HOLD")
 
     async def _get_market_data(self) -> Dict[str, Any]:
-        """Get current market data for decision making."""
-        # TODO: Uncomment this when using real market data from OSRS Wiki API
-        # try:
-        #     client = GrandExchangeClient()
-        #     latest = client.get_latest()
-        #     data_5m = client.get_5m()
-        #
-        #     return {
-        #         "latest": latest,
-        #         "5m": data_5m,
-        #         "timestamp": datetime.now(timezone.utc).isoformat()
-        #     }
-        # except Exception as e:
-        #     logger.warning(f"Could not get market data: {e}")
-        #     return {}
+        """Get current market data for decision making.
 
-        # Mock prices for runes (approximate GE prices) - for testing
-        rune_prices = {
-            "554": {"low": 4, "high": 5},      # Fire rune
-            "555": {"low": 4, "high": 5},      # Water rune
-            "556": {"low": 4, "high": 5},      # Air rune
-            "557": {"low": 4, "high": 5},      # Earth rune
-            "558": {"low": 3, "high": 4},      # Mind rune
-            "559": {"low": 3, "high": 4},      # Body rune
-            "560": {"low": 180, "high": 200},  # Death rune
-            "561": {"low": 180, "high": 200},  # Nature rune
-            "562": {"low": 60, "high": 70},    # Chaos rune
-            "563": {"low": 150, "high": 170},  # Law rune
-            "564": {"low": 120, "high": 140},  # Cosmic rune
-            "565": {"low": 350, "high": 400},  # Blood rune
-            "566": {"low": 300, "high": 350},  # Soul rune
-            "9075": {"low": 140, "high": 160}, # Astral rune
-            "21880": {"low": 400, "high": 450},# Wrath rune
-            "4694": {"low": 500, "high": 600}, # Steam rune
-            "4695": {"low": 500, "high": 600}, # Mist rune
-            "4696": {"low": 500, "high": 600}, # Dust rune
-            "4697": {"low": 500, "high": 600}, # Smoke rune
-            "4698": {"low": 500, "high": 600}, # Mud rune
-            "4699": {"low": 500, "high": 600}, # Lava rune
-        }
+        Fetches real-time data from OSRS Wiki API with caching (60s TTL),
+        with fallback to local mongo_data files.
+        """
+        # Check cache first
+        current_time = time.time()
+        if (self._market_data_cache is not None and
+            current_time - self._market_data_cache_time < self._market_data_cache_ttl):
+            logger.debug("Using cached market data")
+            return self._market_data_cache
 
-        return {
-            "latest": rune_prices,
+        latest_prices = {}
+        volume_data = {}
+
+        # Try to fetch real-time data from OSRS Wiki API
+        try:
+            from api.ge_rest_client import GrandExchangeClient
+
+            # Reuse client if available, otherwise create new one
+            if self._ge_client is None:
+                self._ge_client = GrandExchangeClient(
+                    contact_email="ppoflipperopus@example.com",
+                    project_name="PPOFlipperOpus-Firebase"
+                )
+
+            # Fetch latest prices (instant buy/sell)
+            latest_raw = self._ge_client.get_latest()
+            for item_id, data in latest_raw.items():
+                latest_prices[str(item_id)] = {
+                    'high': data.get('high', 0),
+                    'low': data.get('low', 0),
+                    'high_time': data.get('highTime', 0),
+                    'low_time': data.get('lowTime', 0)
+                }
+            logger.info(f"Fetched {len(latest_prices)} latest prices from API")
+
+            # Fetch 5-minute averaged data (includes volume)
+            data_5m = self._ge_client.get_5m()
+            for item_id, data in data_5m.items():
+                volume_data[str(item_id)] = {
+                    'avg_high_price': data.get('avgHighPrice', 0),
+                    'avg_low_price': data.get('avgLowPrice', 0),
+                    'high_volume': data.get('highPriceVolume', 0),
+                    'low_volume': data.get('lowPriceVolume', 0)
+                }
+            logger.info(f"Fetched {len(volume_data)} 5m volume entries from API")
+
+        except Exception as e:
+            logger.warning(f"Could not fetch real-time data from API: {e}")
+            logger.info("Falling back to local mongo_data files...")
+
+            # Fallback to local mongo_data files
+            base_dir = Path(__file__).parent.parent
+            latest_path = base_dir / "mongo_data" / "latest_prices.json"
+            prices_1h_path = base_dir / "mongo_data" / "prices_1h.json"
+
+            try:
+                # Load latest prices
+                if latest_path.exists():
+                    with open(latest_path, 'r') as f:
+                        prices_list = json.load(f)
+                        for item in prices_list:
+                            item_id = str(item.get('item_id'))
+                            latest_prices[item_id] = {
+                                'high': item.get('high_price', 0),
+                                'low': item.get('low_price', 0),
+                                'high_time': item.get('high_time', 0),
+                                'low_time': item.get('low_time', 0)
+                            }
+                    logger.debug(f"Loaded {len(latest_prices)} latest prices from local file")
+
+                # Load 1h volume data
+                if prices_1h_path.exists():
+                    with open(prices_1h_path, 'r') as f:
+                        volume_list = json.load(f)
+                        for item in volume_list:
+                            item_id = str(item.get('item_id'))
+                            volume_data[item_id] = {
+                                'avg_high_price': item.get('avg_high_price', 0),
+                                'avg_low_price': item.get('avg_low_price', 0),
+                                'high_volume': item.get('high_price_volume', 0),
+                                'low_volume': item.get('low_price_volume', 0)
+                            }
+                    logger.debug(f"Loaded {len(volume_data)} volume entries from local file")
+
+            except Exception as file_error:
+                logger.error(f"Could not load local market data: {file_error}")
+
+        # Cache the result
+        self._market_data_cache = {
+            "latest": latest_prices,
+            "volume": volume_data,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+        self._market_data_cache_time = current_time
+
+        return self._market_data_cache
+
+    def _build_observation(
+        self,
+        gold: int,
+        holdings: Dict[str, Any],
+        active_orders: List[Dict[str, Any]],
+        market_data: Dict[str, Any]
+    ) -> np.ndarray:
+        """
+        Build observation vector matching the training environment format.
+
+        Per item: price (2), volume (2), spread (1), position (2) = 7 features
+        Portfolio: cash, value, pnl = 3 features
+        Time: 4 cyclical features
+        """
+        obs_dim = self.model_config.get('obs_dim', 1407)
+        n_items = len(self.item_list)
+
+        # Initialize observation array
+        obs = np.zeros(obs_dim, dtype=np.float32)
+
+        latest = market_data.get("latest", {})
+        volume = market_data.get("volume", {})
+
+        # Build per-item features
+        idx = 0
+        for item_id in self.item_list:
+            item_id_str = str(item_id)
+
+            # Get price data
+            price_data = latest.get(item_id_str, {})
+            high_price = price_data.get('high', 0)
+            low_price = price_data.get('low', 0)
+
+            # Get volume data
+            vol_data = volume.get(item_id_str, {})
+            high_vol = vol_data.get('high_volume', 0)
+            low_vol = vol_data.get('low_volume', 0)
+
+            # Normalize prices (log scale for better learning)
+            norm_high = np.log1p(high_price) / 15.0 if high_price > 0 else 0
+            norm_low = np.log1p(low_price) / 15.0 if low_price > 0 else 0
+
+            # Normalize volumes (log scale)
+            norm_high_vol = np.log1p(high_vol) / 15.0 if high_vol > 0 else 0
+            norm_low_vol = np.log1p(low_vol) / 15.0 if low_vol > 0 else 0
+
+            # Calculate spread
+            spread = (high_price - low_price) / max(low_price, 1) if low_price > 0 else 0
+            spread = min(spread, 1.0)  # Cap at 100% spread
+
+            # Get position for this item
+            holding = holdings.get(item_id_str, {})
+            position_qty = holding.get('quantity', 0) if isinstance(holding, dict) else 0
+            position_value = position_qty * high_price if high_price > 0 else 0
+
+            # Normalize position
+            norm_qty = np.log1p(position_qty) / 15.0
+            norm_value = np.log1p(position_value) / 20.0
+
+            # Store features for this item
+            if idx + 7 <= obs_dim:
+                obs[idx] = norm_high
+                obs[idx + 1] = norm_low
+                obs[idx + 2] = norm_high_vol
+                obs[idx + 3] = norm_low_vol
+                obs[idx + 4] = spread
+                obs[idx + 5] = norm_qty
+                obs[idx + 6] = norm_value
+
+            idx += 7
+
+        # Portfolio features
+        portfolio_start = n_items * 7
+        if portfolio_start + 3 <= obs_dim:
+            # Cash normalized
+            obs[portfolio_start] = np.log1p(gold) / 25.0
+            # Portfolio value estimate
+            total_value = gold
+            for item_id_str, holding in holdings.items():
+                if isinstance(holding, dict):
+                    qty = holding.get('quantity', 0)
+                    price_data = latest.get(item_id_str, {})
+                    price = price_data.get('high', 0)
+                    total_value += qty * price
+            obs[portfolio_start + 1] = np.log1p(total_value) / 25.0
+            # PnL (just use 0 since we don't track it here)
+            obs[portfolio_start + 2] = 0
+
+        # Time features (cyclical encoding)
+        time_start = portfolio_start + 3
+        if time_start + 4 <= obs_dim:
+            now = datetime.now()
+            hour = now.hour
+            day = now.weekday()
+            # Cyclical encoding
+            obs[time_start] = np.sin(2 * np.pi * hour / 24)
+            obs[time_start + 1] = np.cos(2 * np.pi * hour / 24)
+            obs[time_start + 2] = np.sin(2 * np.pi * day / 7)
+            obs[time_start + 3] = np.cos(2 * np.pi * day / 7)
+
+        return obs
 
     async def _get_ppo_decision(
         self,
@@ -420,111 +691,137 @@ class FirebaseInferenceRunner:
         market_data: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """
-        Get a decision from the PPO agent.
+        Get a decision from the trained PPO model.
 
         Returns:
             Decision dict with action, item_id, quantity, price, confidence
             or None if no action should be taken
         """
-        if self.agent is not None:
-            # Use actual PPO agent
-            # TODO: Implement actual PPO decision making
-            pass
+        # Check if model is loaded
+        if self.feature_extractor is None or self.actor is None:
+            logger.warning("Model not loaded, cannot make decision")
+            return None
 
-        import random
-
-        # Get items we're already trading (have orders for)
+        # Get items we're already trading
         active_item_ids = set()
         for order in active_orders:
             active_item_ids.add(order.get("item_id"))
 
-        # Get rune holdings (filter holdings to only runes we trade)
-        rune_holdings = {}
-        for item_id_str, item_data in holdings.items():
-            item_id = int(item_id_str) if item_id_str.isdigit() else None
-            if item_id and item_id in self.RUNES:
-                rune_holdings[item_id] = item_data
+        try:
+            # Build observation
+            obs = self._build_observation(gold, holdings, active_orders, market_data)
 
-        # Decision: 30% chance to act (buy or sell)
-        if random.random() > 0.3:
-            return None
+            # Convert to tensor
+            obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
 
-        latest = market_data.get("latest", {})
+            # Get model output
+            with torch.no_grad():
+                features = self.feature_extractor(obs_tensor)
+                logits = self.actor(features)
+                value = self.critic(features)
 
-        # If we have runes, 50% chance to sell one
-        if rune_holdings and random.random() > 0.5:
-            # Sell a rune we own
-            item_id = random.choice(list(rune_holdings.keys()))
-            item_data = rune_holdings[item_id]
-            item_name = self.RUNES[item_id]
+                # Get probabilities for action type
+                action_type_probs = torch.softmax(logits["action_type"], dim=-1)
+                item_probs = torch.softmax(logits["item"], dim=-1)
+                price_probs = torch.softmax(logits["price"], dim=-1)
+                quantity_probs = torch.softmax(logits["quantity"], dim=-1)
 
-            # Skip if we already have an order for this item
+                # Sample actions (or use argmax for deterministic)
+                action_type = torch.argmax(action_type_probs, dim=-1).item()
+                item_idx = torch.argmax(item_probs, dim=-1).item()
+                price_bin = torch.argmax(price_probs, dim=-1).item()
+                quantity_bin = torch.argmax(quantity_probs, dim=-1).item()
+
+                # Calculate confidence from the probability of chosen action
+                action_type_conf = action_type_probs[0, action_type].item()
+                item_conf = item_probs[0, item_idx].item()
+                confidence = (action_type_conf + item_conf) / 2
+
+            # Decode action type: 0=hold, 1=buy, 2=sell
+            action_types = ['hold', 'buy', 'sell']
+            action = action_types[action_type]
+
+            if action == 'hold':
+                logger.debug(f"Model decision: HOLD (confidence: {confidence:.2f})")
+                return {"action": "hold", "confidence": confidence}
+
+            # Get item from index
+            if item_idx >= len(self.item_list):
+                item_idx = len(self.item_list) - 1
+            item_id = self.item_list[item_idx]
+            item_name = self.tradeable_items.get(item_id, f"Item_{item_id}")
+
+            # Skip if we already have an active order for this item
             if item_id in active_item_ids:
+                logger.debug(f"Skipping {item_name} - already have active order")
                 return None
 
-            quantity = item_data.get("quantity", 0)
+            # Get price range for this item
+            price_range = self.price_ranges.get(item_id, (100, 10000))
+            min_price, max_price = price_range
+
+            # Get current market price
+            latest = market_data.get("latest", {})
+            price_data = latest.get(str(item_id), {})
+            market_high = price_data.get('high', max_price)
+            market_low = price_data.get('low', min_price)
+
+            if market_high == 0:
+                market_high = max_price
+            if market_low == 0:
+                market_low = min_price
+
+            # Decode price from bin
+            price_bins = self.model_config.get('price_bins', 21)
+            price_frac = price_bin / max(price_bins - 1, 1)
+
+            if action == 'buy':
+                # For buying, use the low end of market
+                price = int(market_low * (0.95 + 0.1 * price_frac))  # 95% to 105% of low
+            else:
+                # For selling, use the high end of market
+                price = int(market_high * (0.98 + 0.1 * price_frac))  # 98% to 108% of high
+
+            price = max(1, price)
+
+            # Decode quantity from bin
+            quantity_bins = self.model_config.get('quantity_bins', 11)
+            buy_limit = self.model_buy_limits.get(item_id, 5000)
+            quantity_frac = quantity_bin / max(quantity_bins - 1, 1)
+
+            # Calculate quantity based on available gold and buy limit
+            if action == 'buy':
+                max_affordable = gold // max(price, 1)
+                max_quantity = min(buy_limit, max_affordable)
+                quantity = max(1, int(max_quantity * quantity_frac * 0.5))  # Use up to 50% of max
+            else:
+                # For selling, check holdings
+                holding = holdings.get(str(item_id), {})
+                available_qty = holding.get('quantity', 0) if isinstance(holding, dict) else 0
+                quantity = max(1, int(available_qty * quantity_frac))
+
             if quantity <= 0:
+                logger.debug(f"Skipping {action} {item_name} - quantity is 0")
                 return None
 
-            # Sell up to 1000 at a time
-            sell_quantity = min(quantity, random.randint(100, 1000))
-
-            # Get current high price from market data
-            item_prices = latest.get(str(item_id), {})
-            price = item_prices.get("high", 5)  # Default 5gp for runes
-
-            # Add small margin for profit
-            sell_price = int(price * 1.02)  # 2% above market
+            logger.info(f"Model decision: {action.upper()} {quantity}x {item_name} @ {price} "
+                       f"(confidence: {confidence:.2f}, value: {value.item():.4f})")
 
             return {
-                "action": "sell",
+                "action": action,
                 "item_id": item_id,
                 "item_name": item_name,
-                "quantity": sell_quantity,
-                "price": sell_price,
-                "confidence": random.uniform(0.75, 0.95)
+                "quantity": quantity,
+                "price": price,
+                "confidence": confidence,
+                "value_estimate": value.item()
             }
-        else:
-            # Buy a random rune
-            # Pick a rune we don't have an active order for
-            available_runes = [
-                (item_id, name) for item_id, name in self.RUNES.items()
-                if item_id not in active_item_ids
-            ]
 
-            if not available_runes:
-                return None
-
-            item_id, item_name = random.choice(available_runes)
-
-            # Get current low price from market data
-            item_prices = latest.get(str(item_id), {})
-            price = item_prices.get("low", 5)  # Default 5gp for runes
-
-            # Bid slightly below market for better fills
-            buy_price = max(1, int(price * 0.98))  # 2% below market
-
-            # Calculate affordable quantity (use 10-20% of gold per order)
-            max_spend = int(gold * random.uniform(0.1, 0.2))
-            max_quantity = max_spend // max(buy_price, 1)
-
-            if max_quantity <= 0:
-                return None
-
-            # Buy between 100-1000 runes
-            buy_quantity = min(max_quantity, random.randint(100, 1000))
-
-            if buy_quantity < 10:  # Don't bother with tiny orders
-                return None
-
-            return {
-                "action": "buy",
-                "item_id": item_id,
-                "item_name": item_name,
-                "quantity": buy_quantity,
-                "price": buy_price,
-                "confidence": random.uniform(0.75, 0.95)
-            }
+        except Exception as e:
+            logger.error(f"Error in PPO decision: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     async def _execute_buy(self, decision: Dict[str, Any]):
         """Execute a buy order."""
@@ -634,6 +931,7 @@ class FirebaseInferenceRunner:
         print(f"  Plugin Online: {status.get('plugin_online')}")
         print(f"  Gold: {status.get('gold', 0):,}")
         print(f"  Holdings: {status.get('holdings_count', 0)} items")
+        print(f"  Positions: {status.get('holdings_count', 0)}/{MAX_OUTSTANDING_POSITIONS}")
         print(f"  Active Orders: {status.get('active_orders', 0)}")
         print(f"  Available Slots: {status.get('available_slots', 0)}")
         print("-" * 60)
