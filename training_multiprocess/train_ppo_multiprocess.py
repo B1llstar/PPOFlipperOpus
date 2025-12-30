@@ -187,7 +187,7 @@ def gradient_coordinator(
             # Wait at barrier for all workers to submit gradients
             logger.info("[Coordinator] Waiting at barrier for workers to submit gradients...")
             try:
-                barrier.wait(timeout=120)
+                barrier.wait(timeout=600)  # 10 minute timeout to match workers
                 logger.info("[Coordinator] All workers reached barrier")
             except Exception as e:
                 logger.error(f"[Coordinator] Barrier wait failed (timeout or broken): {e}")
@@ -408,7 +408,9 @@ def worker_process(
         
         while step < max_steps and not stop_event.is_set():
             # Collect rollout
-            for _ in range(rollout_steps):
+            rollout_start_step = step
+            logger.info(f"[Worker {worker_id}] Starting rollout collection (steps {step}-{step+rollout_steps})")
+            for rollout_idx in range(rollout_steps):
                 # Sample action from policy
                 action_dict, log_prob = agent.sample_action(obs, deterministic=False)
                 
@@ -436,6 +438,10 @@ def worker_process(
                 episode_length += 1
                 step += 1
                 pbar.update(1)
+                
+                # Log progress during rollout (helps identify slow workers)
+                if rollout_idx > 0 and rollout_idx % 100 == 0:
+                    logger.debug(f"[Worker {worker_id}] Rollout progress: {rollout_idx}/{rollout_steps} steps")
                 pbar.set_postfix({
                     'ep': episode,
                     'ep_rew': f'{episode_reward:.1f}',
@@ -464,6 +470,9 @@ def worker_process(
                 # Check if should stop
                 if step >= max_steps or stop_event.is_set():
                     break
+            
+            # Log rollout completion
+            logger.info(f"[Worker {worker_id}] ✓ Rollout complete: {rollout_steps} steps collected")
             
             # Update policy
             logger.info(f"Step {step}: Running PPO update...")
@@ -504,7 +513,7 @@ def worker_process(
                 if barrier is not None:
                     logger.info(f"[Worker {worker_id}] ⏳ Approaching barrier (step {step})...")
                     try:
-                        barrier.wait(timeout=180)  # 3 minute timeout
+                        barrier.wait(timeout=600)  # 10 minute timeout
                         logger.info(f"[Worker {worker_id}] ✓ Barrier passed, waiting for parameter update...")
                     except Exception as e:
                         logger.error(f"Barrier wait failed: {e}. Worker will exit.")

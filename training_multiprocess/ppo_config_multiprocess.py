@@ -27,16 +27,16 @@ PPO_KWARGS = {
     "quantity_bins": 10,  # Number of discrete quantity levels for action space
     "wait_steps_bins": 10,  # Number of discrete wait time options for action space
     "risk_tolerance": 0.3,  # Maximum portfolio allocation per single item (30%)
-    "rollout_steps": 2048,  # Number of environment steps collected before policy update
+    "rollout_steps": 512,  # Number of environment steps collected before policy update (reduced for 20 workers)
     "minibatch_size": 64,  # Batch size for minibatch SGD during policy optimization
     "ppo_epochs": 10,  # Number of epochs to train on each batch of rollout data
 }
 
 # Training Configuration
 TRAIN_KWARGS = {
-    # H100: 20 workers × 3.5GB = ~70GB (87.5% of 80GB, safe buffer)
-    "num_workers": 20,  # Number of parallel environment workers for data collection
-    "max_steps_per_worker": 5120,  # Maximum training steps per worker (10M total)
+    # H100: 10 workers × 3.5GB = ~35GB (43.75% of 80GB, safe buffer)
+    "num_workers": 10,  # Number of parallel environment workers for data collection
+    "max_steps_per_worker": 10240,  # Maximum training steps per worker (doubled for 10 workers)
     "save_every_steps": 100,  # Save model checkpoint every N steps
     "log_every_steps": 1_000,  # Log training metrics (loss, rewards) every N steps
     "eval_every_steps": 25_000,  # Run evaluation episodes every N steps
