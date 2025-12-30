@@ -310,6 +310,92 @@ class OrderManager:
         logger.info(f"Cancelled {count} pending orders")
         return count
 
+    def cleanup_stale_orders(self, max_age_seconds: int = 300) -> int:
+        """
+        Mark stale orders as completed.
+
+        Orders that have been in 'placed' or 'received' status for too long
+        are likely already collected manually in-game. This syncs the state.
+
+        Args:
+            max_age_seconds: Orders older than this are considered stale (default 5 min)
+
+        Returns:
+            Number of orders cleaned up
+        """
+        from datetime import datetime, timezone, timedelta
+
+        try:
+            active_orders = self.get_active_orders()
+            now = datetime.now(timezone.utc)
+            cleaned = 0
+
+            for order in active_orders:
+                # Check order age
+                created_at = order.get("created_at", "")
+                if not created_at:
+                    continue
+
+                try:
+                    if isinstance(created_at, str):
+                        order_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    else:
+                        order_time = created_at
+
+                    age_seconds = (now - order_time).total_seconds()
+
+                    if age_seconds > max_age_seconds:
+                        order_id = order.get("order_id")
+                        status = order.get("status")
+                        item_name = order.get("item_name", "unknown")
+
+                        logger.info(f"Cleaning stale order {order_id}: {item_name} "
+                                   f"(status: {status}, age: {int(age_seconds)}s)")
+
+                        # Mark as completed (assume it was collected manually)
+                        self.complete_order(
+                            order_id,
+                            metadata={"cleanup_reason": "stale_order", "age_seconds": age_seconds}
+                        )
+                        cleaned += 1
+
+                except Exception as e:
+                    logger.warning(f"Error checking order age: {e}")
+                    continue
+
+            if cleaned > 0:
+                logger.info(f"Cleaned up {cleaned} stale orders")
+
+            return cleaned
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup stale orders: {e}")
+            return 0
+
+    def force_complete_all_active(self, reason: str = "Manual sync") -> int:
+        """
+        Force complete all active orders.
+
+        Use this when you've manually collected all items in-game and want
+        to sync the Firebase state.
+
+        Args:
+            reason: Reason for force completion
+
+        Returns:
+            Number of orders completed
+        """
+        active_orders = self.get_active_orders()
+        count = 0
+
+        for order in active_orders:
+            order_id = order.get("order_id")
+            if self.complete_order(order_id, metadata={"force_reason": reason}):
+                count += 1
+
+        logger.info(f"Force completed {count} active orders: {reason}")
+        return count
+
     def complete_order(self, order_id: str, filled_quantity: int = None,
                        total_cost: int = None, metadata: Dict[str, Any] = None) -> bool:
         """

@@ -435,20 +435,31 @@ class FirebaseInferenceRunner:
         gold = portfolio.get("gold", 0)
         holdings = portfolio.get("holdings", {})
 
-        # Get active orders
+        # Get active orders from Firebase
         active_orders = self.bridge.get_active_orders()
-        active_count = len(active_orders)
+        firebase_order_count = len(active_orders)
+
+        # Try to get actual GE slot usage from the plugin (more accurate than our tracking)
+        plugin_slots_used = self.bridge.portfolio_tracker.get_used_slots()
+
+        # Use the plugin's slot count if available, otherwise fall back to Firebase order count
+        if plugin_slots_used is not None and plugin_slots_used >= 0:
+            active_count = plugin_slots_used
+            if firebase_order_count != plugin_slots_used:
+                logger.debug(f"Slot count: plugin={plugin_slots_used}, firebase={firebase_order_count}")
+        else:
+            active_count = firebase_order_count
 
         # Check if we have room for more orders
         if active_count >= MAX_ACTIVE_ORDERS:
-            logger.debug(f"Max active orders reached ({active_count})")
+            logger.info(f"Slots full ({active_count}/{MAX_ACTIVE_ORDERS}) - waiting for orders to complete")
             return
 
         # Check outstanding positions limit (number of different items held)
         positions_count = len([h for h in holdings.values()
                               if isinstance(h, dict) and h.get('quantity', 0) > 0])
         if positions_count >= MAX_OUTSTANDING_POSITIONS:
-            logger.debug(f"Max outstanding positions reached ({positions_count}/{MAX_OUTSTANDING_POSITIONS})")
+            logger.info(f"Max positions reached ({positions_count}/{MAX_OUTSTANDING_POSITIONS}) - waiting to sell")
             return
 
         # Get market data for decision making
@@ -479,7 +490,7 @@ class FirebaseInferenceRunner:
         elif action == "sell":
             await self._execute_sell(decision)
         elif action == "hold":
-            logger.debug("Decision: HOLD")
+            logger.info(f"Decision: HOLD (confidence: {confidence:.2f})")
 
     async def _get_market_data(self) -> Dict[str, Any]:
         """Get current market data for decision making.
@@ -748,8 +759,38 @@ class FirebaseInferenceRunner:
             action = action_types[action_type]
 
             if action == 'hold':
-                logger.debug(f"Model decision: HOLD (confidence: {confidence:.2f})")
+                logger.info(f"Model decision: HOLD (confidence: {confidence:.2f})")
                 return {"action": "hold", "confidence": confidence}
+
+            # For SELL actions, we can ONLY sell items we actually hold
+            # Build list of items we have in holdings
+            held_item_ids = set()
+            for item_id_str, holding in holdings.items():
+                if isinstance(holding, dict) and holding.get('quantity', 0) > 0:
+                    try:
+                        held_item_ids.add(int(item_id_str))
+                    except (ValueError, TypeError):
+                        pass
+
+            if action == 'sell':
+                if not held_item_ids:
+                    logger.info("SELL requested but no holdings available - switching to HOLD")
+                    return {"action": "hold", "confidence": confidence}
+
+                # For sells, only consider items we actually hold
+                # Mask the item probabilities to only include held items
+                held_indices = [i for i, item_id in enumerate(self.item_list) if item_id in held_item_ids]
+
+                if not held_indices:
+                    logger.info("SELL requested but none of our holdings are in tradeable items - switching to HOLD")
+                    return {"action": "hold", "confidence": confidence}
+
+                # Sample only from held items
+                held_probs = item_probs[0, held_indices]
+                held_probs = held_probs / held_probs.sum()  # Renormalize
+                held_dist = torch.distributions.Categorical(held_probs)
+                held_sample_idx = held_dist.sample().item()
+                item_idx = held_indices[held_sample_idx]
 
             # Get item from index
             if item_idx >= len(self.item_list):
@@ -801,10 +842,18 @@ class FirebaseInferenceRunner:
                 max_quantity = min(buy_limit, max_affordable)
                 quantity = max(1, int(max_quantity * quantity_frac * 0.5))  # Use up to 50% of max
             else:
-                # For selling, check holdings
+                # For selling, check holdings - ONLY sell what we actually have
                 holding = holdings.get(str(item_id), {})
                 available_qty = holding.get('quantity', 0) if isinstance(holding, dict) else 0
-                quantity = max(1, int(available_qty * quantity_frac))
+
+                if available_qty <= 0:
+                    logger.info(f"Skipping SELL {item_name} - no holdings (qty: {available_qty})")
+                    return None
+
+                # Sell between 10% and 100% of holdings based on quantity_frac
+                quantity = max(1, int(available_qty * (0.1 + 0.9 * quantity_frac)))
+                # Never sell more than we have
+                quantity = min(quantity, available_qty)
 
             if quantity <= 0:
                 logger.debug(f"Skipping {action} {item_name} - quantity is 0")

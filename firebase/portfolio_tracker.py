@@ -468,6 +468,32 @@ class PortfolioTracker:
         slots = self.get_ge_slots_state()
         return [i for i in range(1, 9) if slots.get(i) is None]
 
+    def get_used_slots(self) -> Optional[int]:
+        """
+        Get the number of GE slots currently in use according to the plugin.
+
+        Returns:
+            Number of slots in use (0-8), or None if data not available
+        """
+        # First try the detailed GE slots data
+        ge_data = self.get_ge_slots()
+        if ge_data:
+            buy_used = ge_data.get("buy_slots_used", 0)
+            sell_used = ge_data.get("sell_slots_used", 0)
+            return buy_used + sell_used
+
+        # Fallback: count non-empty slots from state
+        slots = self.get_ge_slots_state()
+        if slots:
+            return sum(1 for slot in slots.values() if slot is not None)
+
+        # Fallback: use available slots from account
+        available = self.get_available_slots()
+        if available is not None and available >= 0:
+            return 8 - available
+
+        return None
+
     def get_active_buy_slots(self) -> List[Dict[str, Any]]:
         """Get list of active buy orders with slot info."""
         slots = self.get_ge_slots_state()
