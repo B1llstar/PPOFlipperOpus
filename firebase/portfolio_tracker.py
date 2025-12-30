@@ -173,10 +173,24 @@ class PortfolioTracker:
         return None
 
     def get_gold(self) -> int:
-        """Get current gold balance."""
+        """Get current gold balance from portfolio or account document."""
+        # Try portfolio first
         portfolio = self.get_portfolio()
         if portfolio:
-            return portfolio.get("gold", 0)
+            gold = portfolio.get("gold", 0)
+            if gold > 0:
+                return gold
+
+        # Fallback to account document (uses current_gold field)
+        if self._current_account:
+            gold = self._current_account.get("current_gold", 0)
+            if gold > 0:
+                return gold
+            # Also check 'gold' field directly
+            gold = self._current_account.get("gold", 0)
+            if gold > 0:
+                return gold
+
         return 0
 
     def get_holdings(self) -> Dict[str, Dict[str, Any]]:

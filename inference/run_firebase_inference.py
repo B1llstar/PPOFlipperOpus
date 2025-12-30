@@ -726,11 +726,17 @@ class FirebaseInferenceRunner:
                 price_probs = torch.softmax(logits["price"], dim=-1)
                 quantity_probs = torch.softmax(logits["quantity"], dim=-1)
 
-                # Sample actions (or use argmax for deterministic)
-                action_type = torch.argmax(action_type_probs, dim=-1).item()
-                item_idx = torch.argmax(item_probs, dim=-1).item()
-                price_bin = torch.argmax(price_probs, dim=-1).item()
-                quantity_bin = torch.argmax(quantity_probs, dim=-1).item()
+                # Stochastic sampling from probability distributions
+                # This allows exploration across different items instead of always picking the same one
+                action_type_dist = torch.distributions.Categorical(action_type_probs)
+                item_dist = torch.distributions.Categorical(item_probs)
+                price_dist = torch.distributions.Categorical(price_probs)
+                quantity_dist = torch.distributions.Categorical(quantity_probs)
+
+                action_type = action_type_dist.sample().item()
+                item_idx = item_dist.sample().item()
+                price_bin = price_dist.sample().item()
+                quantity_bin = quantity_dist.sample().item()
 
                 # Calculate confidence from the probability of chosen action
                 action_type_conf = action_type_probs[0, action_type].item()
