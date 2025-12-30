@@ -188,8 +188,12 @@ def gradient_coordinator(
             logger.info("[Coordinator] Waiting at barrier for workers to submit gradients...")
             try:
                 barrier.wait(timeout=120)
+                logger.info("[Coordinator] All workers reached barrier")
             except Exception as e:
-                logger.error(f"[Coordinator] Barrier wait failed: {e}")
+                logger.error(f"[Coordinator] Barrier wait failed (timeout or broken): {e}")
+                logger.error("[Coordinator] One or more workers may have crashed or hung")
+                logger.error("[Coordinator] Check individual worker logs in logs/ directory")
+                stop_event.set()  # Signal all workers to stop
                 break
             
             # Collect gradients from all workers
@@ -494,13 +498,17 @@ def worker_process(
                     'loss_info': loss_info,
                     'steps': rollout_steps  # Steps collected in this rollout
                 })
-                logger.info("Gradients sent to coordinator")
+                logger.info(f"[Worker {worker_id}] Gradients sent to coordinator")
                 
                 # Wait at barrier for all workers to submit gradients
                 if barrier is not None:
-                    logger.info("Waiting at barrier for all workers...")
-                    barrier.wait()
-                    logger.info("Barrier passed, waiting for parameter update...")
+                    logger.info(f"[Worker {worker_id}] ⏳ Approaching barrier (step {step})...")
+                    try:
+                        barrier.wait(timeout=180)  # 3 minute timeout
+                        logger.info(f"[Worker {worker_id}] ✓ Barrier passed, waiting for parameter update...")
+                    except Exception as e:
+                        logger.error(f"Barrier wait failed: {e}. Worker will exit.")
+                        raise RuntimeError(f"Worker {worker_id} barrier synchronization failed") from e
                 
                 # Wait for parameter update from coordinator
                 param_update_event.wait()
@@ -593,10 +601,18 @@ def worker_process(
         
     except Exception as e:
         logger.error(f"Worker {worker_id} failed with error: {e}", exc_info=True)
-        progress_queue.put({
-            'worker_id': worker_id,
-            'error': str(e)
-        })
+        try:
+            progress_queue.put({
+                'worker_id': worker_id,
+                'error': str(e),
+                'step': step if 'step' in locals() else 0,
+                'fatal': True
+            }, timeout=5)
+        except:
+            pass  # Queue might be full or closed
+        # Set stop event to signal other workers and coordinator
+        if stop_event is not None:
+            stop_event.set()
         raise
 
 
@@ -827,6 +843,9 @@ def main():
                 
                 if 'error' in update:
                     logger.error(f"Worker {worker_id} reported error: {update['error']}")
+                    if update.get('fatal', False):
+                        logger.error(f"Worker {worker_id} encountered fatal error - stopping all workers")
+                        stop_event.set()
                     continue
                 
                 worker_status[worker_id].update({
@@ -845,6 +864,24 @@ def main():
                     f"speed={update.get('steps_per_sec', 0):.1f} steps/s"
                 )
             
+            # Check for dead workers
+            dead_workers = [i for i, p in enumerate(workers) if not p.is_alive()]
+            if dead_workers:
+                logger.error(f"⚠️  WORKERS DIED: {dead_workers}")
+                logger.error("Check individual worker logs for error details")
+                logger.error("Stopping remaining workers...")
+                stop_event.set()
+                break
+            
+            # Check if coordinator died (only if using shared model)
+            if TRAIN_KWARGS.get("use_shared_model", False):
+                if coordinator is not None and not coordinator.is_alive():
+                    logger.error("⚠️  COORDINATOR DIED!")
+                    logger.error("Check coordinator.log for error details")
+                    logger.error("Stopping all workers...")
+                    stop_event.set()
+                    break
+            
             # Print summary periodically
             if time.time() - last_summary > summary_interval:
                 logger.info("-"*80)
@@ -853,6 +890,15 @@ def main():
                 active_workers = sum(1 for p in workers if p.is_alive())
                 logger.info(f"Active Workers: {active_workers}/{num_workers}")
                 logger.info(f"Total Steps: {total_steps:,}")
+                
+                # Show which workers are alive/dead
+                worker_health = []
+                for i, p in enumerate(workers):
+                    status = "✓ ALIVE" if p.is_alive() else "✗ DEAD"
+                    worker_health.append(f"{i}:{status}")
+                logger.info(f"Worker Health: {' | '.join(worker_health)}")
+                
+                # Show worker progress
                 for worker_id, status in worker_status.items():
                     logger.info(
                         f"  Worker {worker_id}: "
