@@ -80,7 +80,7 @@ MAX_PENDING_ORDERS = 8
 MAX_OUTSTANDING_POSITIONS = 25
 
 # Minimum confidence threshold to execute a trade
-MIN_CONFIDENCE_THRESHOLD = 0.7
+MIN_CONFIDENCE_THRESHOLD = 0.15  # Lowered for testing with early-stage model
 
 # Maximum value for a single order (gp)
 MAX_ORDER_VALUE = 10_000_000  # 10M
