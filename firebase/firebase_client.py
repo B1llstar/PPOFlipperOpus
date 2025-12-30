@@ -41,6 +41,13 @@ class FirebaseClient:
     SUBCOLLECTION_TRADES = "trades"
     SUBCOLLECTION_PORTFOLIO = "portfolio"
     SUBCOLLECTION_ACTIONS = "actions"
+    SUBCOLLECTION_INVENTORY = "inventory"
+    SUBCOLLECTION_BANK = "bank"
+    SUBCOLLECTION_GE_SLOTS = "ge_slots"
+    SUBCOLLECTION_COMMANDS = "commands"
+
+    # Document names
+    DOC_CURRENT = "current"
 
     def __new__(cls):
         """Singleton pattern - only one Firebase client instance."""
@@ -132,6 +139,22 @@ class FirebaseClient:
     def get_actions_ref(self) -> CollectionReference:
         """Get the actions subcollection reference."""
         return self.get_account_ref().collection(self.SUBCOLLECTION_ACTIONS)
+
+    def get_inventory_ref(self) -> DocumentReference:
+        """Get the inventory document reference."""
+        return self.get_account_ref().collection(self.SUBCOLLECTION_INVENTORY).document(self.DOC_CURRENT)
+
+    def get_bank_ref(self) -> DocumentReference:
+        """Get the bank document reference."""
+        return self.get_account_ref().collection(self.SUBCOLLECTION_BANK).document(self.DOC_CURRENT)
+
+    def get_ge_slots_ref(self) -> DocumentReference:
+        """Get the GE slots document reference."""
+        return self.get_account_ref().collection(self.SUBCOLLECTION_GE_SLOTS).document(self.DOC_CURRENT)
+
+    def get_commands_ref(self) -> CollectionReference:
+        """Get the commands subcollection reference."""
+        return self.get_account_ref().collection(self.SUBCOLLECTION_COMMANDS)
 
     # =========================================================================
     # Item Lookups

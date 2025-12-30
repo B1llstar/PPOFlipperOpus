@@ -417,3 +417,198 @@ class InferenceBridge:
             "net_profit": pnl["net_profit"],
             "total_trades": pnl["buy_count"] + pnl["sell_count"]
         }
+
+    # =========================================================================
+    # Bank and Inventory Access
+    # =========================================================================
+
+    def get_bank_holdings(self) -> Dict[str, Dict[str, Any]]:
+        """Get items currently in bank."""
+        return self.portfolio_tracker.get_bank_holdings()
+
+    def get_bank_item_quantity(self, item_id: int) -> int:
+        """Get quantity of a specific item in bank."""
+        return self.portfolio_tracker.get_bank_item_quantity(item_id)
+
+    def get_awaiting_sell(self) -> List[int]:
+        """Get list of tradeable item IDs in bank awaiting sell."""
+        return self.portfolio_tracker.get_awaiting_sell()
+
+    def get_inventory(self) -> Optional[Dict[str, Any]]:
+        """Get current inventory state."""
+        return self.portfolio_tracker.get_inventory()
+
+    def get_all_holdings(self) -> Dict[int, Dict[str, Any]]:
+        """Get combined holdings from inventory and bank."""
+        return self.portfolio_tracker.get_all_holdings()
+
+    def get_total_item_quantity(self, item_id: int) -> int:
+        """Get total quantity across inventory and bank."""
+        return self.portfolio_tracker.get_total_item_quantity(item_id)
+
+    # =========================================================================
+    # GE Slots Access
+    # =========================================================================
+
+    def get_ge_slots_state(self) -> Dict[int, Optional[Dict[str, Any]]]:
+        """Get GE slot states keyed by slot number (1-8)."""
+        return self.portfolio_tracker.get_ge_slots_state()
+
+    def get_buy_slots_used(self) -> int:
+        """Get number of slots used for buy orders."""
+        return self.portfolio_tracker.get_buy_slots_used()
+
+    def get_sell_slots_used(self) -> int:
+        """Get number of slots used for sell orders."""
+        return self.portfolio_tracker.get_sell_slots_used()
+
+    def get_empty_slots(self) -> List[int]:
+        """Get list of empty slot numbers."""
+        return self.portfolio_tracker.get_empty_slots()
+
+    # =========================================================================
+    # Command Submission
+    # =========================================================================
+
+    def submit_withdraw_command(
+        self,
+        item_id: int,
+        item_name: str,
+        quantity: int,
+        as_note: bool = False,
+        priority: int = 5
+    ) -> Optional[str]:
+        """
+        Submit a command to withdraw items from bank.
+
+        Args:
+            item_id: Item ID to withdraw
+            item_name: Item name
+            quantity: Quantity to withdraw (-1 for all)
+            as_note: Whether to withdraw as noted
+            priority: Command priority (1-10, higher = more urgent)
+
+        Returns:
+            Command ID if successful, None otherwise
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        command_id = f"cmd_{uuid.uuid4().hex[:12]}"
+
+        command_data = {
+            "command_id": command_id,
+            "command_type": "withdraw",
+            "status": "pending",
+            "item_id": item_id,
+            "item_name": item_name,
+            "quantity": quantity,
+            "as_note": as_note,
+            "priority": priority,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        try:
+            self.client.get_commands_ref().document(command_id).set(command_data)
+            logger.info(f"Submitted withdraw command: {command_id} for {quantity}x {item_name}")
+            return command_id
+        except Exception as e:
+            logger.error(f"Failed to submit withdraw command: {e}")
+            return None
+
+    def submit_deposit_command(
+        self,
+        item_id: int,
+        item_name: str,
+        quantity: int,
+        priority: int = 5
+    ) -> Optional[str]:
+        """
+        Submit a command to deposit items to bank.
+
+        Args:
+            item_id: Item ID to deposit
+            item_name: Item name
+            quantity: Quantity to deposit (-1 for all)
+            priority: Command priority (1-10)
+
+        Returns:
+            Command ID if successful, None otherwise
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        command_id = f"cmd_{uuid.uuid4().hex[:12]}"
+
+        command_data = {
+            "command_id": command_id,
+            "command_type": "deposit",
+            "status": "pending",
+            "item_id": item_id,
+            "item_name": item_name,
+            "quantity": quantity,
+            "priority": priority,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        try:
+            self.client.get_commands_ref().document(command_id).set(command_data)
+            logger.info(f"Submitted deposit command: {command_id} for {quantity}x {item_name}")
+            return command_id
+        except Exception as e:
+            logger.error(f"Failed to submit deposit command: {e}")
+            return None
+
+    def submit_deposit_all_command(self, priority: int = 5) -> Optional[str]:
+        """
+        Submit a command to deposit all items to bank.
+
+        Returns:
+            Command ID if successful, None otherwise
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        command_id = f"cmd_{uuid.uuid4().hex[:12]}"
+
+        command_data = {
+            "command_id": command_id,
+            "command_type": "deposit_all",
+            "status": "pending",
+            "priority": priority,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        try:
+            self.client.get_commands_ref().document(command_id).set(command_data)
+            logger.info(f"Submitted deposit_all command: {command_id}")
+            return command_id
+        except Exception as e:
+            logger.error(f"Failed to submit deposit_all command: {e}")
+            return None
+
+    def get_pending_commands(self) -> List[Dict[str, Any]]:
+        """Get all pending commands."""
+        try:
+            docs = (
+                self.client.get_commands_ref()
+                .where("status", "==", "pending")
+                .get()
+            )
+            return [doc.to_dict() for doc in docs]
+        except Exception as e:
+            logger.error(f"Failed to get pending commands: {e}")
+            return []
+
+    def get_command_status(self, command_id: str) -> Optional[Dict[str, Any]]:
+        """Get status of a specific command."""
+        try:
+            doc = self.client.get_commands_ref().document(command_id).get()
+            if doc.exists:
+                return doc.to_dict()
+        except Exception as e:
+            logger.error(f"Failed to get command status: {e}")
+        return None
