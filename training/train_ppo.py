@@ -448,7 +448,12 @@ def main():
     # Use cached 1h volume data
     volume_data = volume_data_1h
     
-    # id_to_name_map is already created above
+    # Create id_to_name_map and name_to_id_map early for use below
+    id_to_name_map = {}
+    name_to_id_map = {}
+    for item_id, item_name in id_name_map.items():
+        id_to_name_map[item_id] = item_name
+        name_to_id_map[item_name] = item_id
     
     # Calculate total volume for each item immediately after building the dictionary
     item_volumes = {}
@@ -475,13 +480,7 @@ def main():
     
     item_list, price_ranges, buy_limits = get_item_lists(items)
     
-    # Create a mapping from item ID to item name
-    id_name_map, _ = read_mapping_file()
-    id_to_name_map = {}
-    for item_id, item_name in id_name_map.items():
-        id_to_name_map[item_id] = item_name
-    
-    # Initialize volume analyzer
+    # Initialize volume analyzer (id_to_name_map already created above)
     volume_analyzer = create_volume_analyzer(id_to_name_map)
     
     # Update volume analyzer with cached data (NO API CALLS)
@@ -609,12 +608,20 @@ def main():
     NUM_AGENTS = TRAIN_KWARGS.get("num_agents", 5)
     logger.info(f"Training with {NUM_AGENTS} parallel agents")
     
-    # Create shared knowledge repository
-    shared_knowledge = SharedKnowledgeRepository(id_to_name_map, name_to_id_map)
+    # Create shared knowledge repository (loads mappings internally)
+    shared_knowledge = SharedKnowledgeRepository()
     
     # Initialize with cached volume data (NO API CALLS)
     shared_knowledge.update_volume_data(volume_data_5m, volume_data_1h)
     logger.info(f"Shared knowledge repository initialized with cached volume data")
+    
+    # Pre-load cache once to avoid each environment loading it separately
+    cache_file = ENV_KWARGS.get("cache_file", "training_cache.json")
+    if cache_file:
+        from training.cached_market_loader import load_cache
+        logger.info(f"Pre-loading cache once for all agents: {cache_file}")
+        load_cache(cache_file, use_shared_memory=False)  # Load into memory once
+        logger.info(f"✓ Cache pre-loaded and ready for {NUM_AGENTS} agents")
     
     # No need to track GP history in memory; all GP logging will be done via logger
     agents = []
@@ -884,8 +891,9 @@ def main():
     shared_knowledge_thread.start()
     logger.info(f"Started shared knowledge update thread")
     
-    # Also start the regular item updates
-    update_items_periodically(client, id_name_map, buy_limits_map, 300, update_items_callback)
+    # Periodic item updates disabled - using cached data for training
+    # update_items_periodically(client, id_name_map, buy_limits_map, 300, update_items_callback)
+    
     # Set up save directory
     base_save_dir = "agent_states"
     os.makedirs(base_save_dir, exist_ok=True)
@@ -1517,8 +1525,9 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
     if os.path.exists(state_path):
         obs = env._get_obs()
     else:
-        obs = env.reset()
-    logger.info(f"GP_LOG | Agent {agent_idx} | Step 0 | GP {obs.get('gp', 0)}")
+        reset_result = env.reset()
+        obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+    logger.info(f"GP_LOG | Agent {agent_idx} | Step 0 | GP {env.cash}")
     step_count = 0
     rollout_steps = ppo_kwargs["rollout_steps"]
     unique_items_traded = {}
@@ -3112,13 +3121,17 @@ def agent_worker(agent_idx, log_queue, items, price_ranges, buy_limits, device, 
                     env.save_state(state_path)
                 except Exception as e:
                     logger.error(f"Failed to save environment state for agent {agent_idx}: {e}")
-                obs = env.reset()
+                reset_result = env.reset()
+                obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
                 if step_count % 500 == 0:
                     logger.info(f"GP_LOG | Agent {agent_idx} | Step {step_count} | GP {obs['gp']}")
 
 if __name__ == "__main__":
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    multiprocessing.set_start_method('spawn', force=True)
+    
     # To run agents concurrently with process-safe logging:
-    use_multiprocessing = True  # Set to False to use single-process main()
+    use_multiprocessing = False  # Set to False to use single-process main() - REQUIRED: multiprocessing mode incompatible with current environment
     if use_multiprocessing:
         log_queue = multiprocessing.Queue(-1)
         listener = start_logging_listener(log_queue)

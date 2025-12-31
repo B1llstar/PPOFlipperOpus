@@ -173,8 +173,26 @@ class GrandExchangeEnv(gym.Env):
             try:
                 from training.cached_market_loader import get_cache, load_cache
                 
-                print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
-                load_cache(self.cache_file)
+                # Get cache reference (should be pre-loaded in shared memory)
+                from training.cached_market_loader import get_cache, load_cache_from_shared_memory
+                import os
+                
+                # If cache was pre-loaded, attach to shared memory
+                if os.environ.get('CACHE_PRELOADED') == '1':
+                    shm_name = os.environ.get('CACHE_SHM_NAME')
+                    if shm_name:
+                        load_cache_from_shared_memory(shm_name)
+                        print(f"[DEBUG] ✓ Attached to shared cache: {shm_name}")
+                    else:
+                        print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
+                        from training.cached_market_loader import load_cache
+                        load_cache(self.cache_file, force_reload=False, use_shared_memory=False)
+                else:
+                    # Not pre-loaded, load it now
+                    print(f"[DEBUG] Loading market data from cache: {self.cache_file}")
+                    from training.cached_market_loader import load_cache
+                    load_cache(self.cache_file, force_reload=False, use_shared_memory=False)
+                
                 cache = get_cache()
                 
                 # Get top N items from cache
