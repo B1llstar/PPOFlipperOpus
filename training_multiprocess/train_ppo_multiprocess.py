@@ -774,9 +774,9 @@ def worker_process(
             }, timeout=5)
         except:
             pass  # Queue might be full or closed
-        # Set stop event to signal other workers and coordinator
-        if stop_event is not None:
-            stop_event.set()
+        # NOTE: Do NOT set stop_event here - let main process decide whether to stop
+        # based on how many workers have failed. This prevents cascade failures
+        # where one worker crash kills all others.
         raise
 
 
@@ -1041,12 +1041,36 @@ def main():
             
             # Check for dead workers
             dead_workers = [i for i, p in enumerate(workers) if not p.is_alive()]
-            if dead_workers:
-                logger.error(f"⚠️  WORKERS DIED: {dead_workers}")
-                logger.error("Check individual worker logs for error details")
-                logger.error("Stopping remaining workers...")
-                stop_event.set()
-                break
+            alive_workers = num_workers - len(dead_workers)
+
+            # For shared model training, ALL workers must stay alive due to barrier synchronization
+            # For independent training, we can tolerate some worker deaths
+            if TRAIN_KWARGS.get("use_shared_model", False):
+                # Shared model mode - ANY worker death breaks the barrier, must stop
+                if dead_workers:
+                    logger.error(f"⚠️  WORKERS DIED: {dead_workers}")
+                    logger.error("Shared model training requires ALL workers (barrier sync)")
+                    logger.error("Check individual worker logs for error details:")
+                    for dead_id in dead_workers:
+                        logger.error(f"  - logs/worker_{dead_id}.log")
+                    logger.error("Stopping remaining workers...")
+                    stop_event.set()
+                    break
+            else:
+                # Independent training - allow graceful degradation
+                # Only stop if too many workers have died (less than 50% remaining)
+                min_workers_required = max(1, num_workers // 2)
+
+                if dead_workers and alive_workers < min_workers_required:
+                    logger.error(f"⚠️  TOO MANY WORKERS DIED: {dead_workers}")
+                    logger.error(f"Only {alive_workers}/{num_workers} workers remaining (need at least {min_workers_required})")
+                    logger.error("Check individual worker logs for error details")
+                    logger.error("Stopping remaining workers...")
+                    stop_event.set()
+                    break
+                elif dead_workers:
+                    # Some workers died but we can continue with reduced capacity
+                    logger.warning(f"⚠️  Workers died: {dead_workers}, but continuing with {alive_workers} workers")
             
             # Check if coordinator died (only if using shared model)
             if TRAIN_KWARGS.get("use_shared_model", False):

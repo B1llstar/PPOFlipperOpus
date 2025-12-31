@@ -5,15 +5,15 @@ Production settings for H100 SXM 80GB parallel training.
 Optimized for convergence with 200 items.
 
 Target: ~50M total environment steps for robust convergence
-- 16 workers × 3.2M steps each = 51.2M total steps
-- With 2048 rollout steps, this is ~1,562 updates per worker
+- 10 workers × 5.12M steps each = 51.2M total steps
+- With 2048 rollout steps, this is ~2,500 updates per worker
 - Total training time estimate: 4-8 hours on H100
 
 Key optimizations:
 - Higher learning rate (5e-4) for faster initial learning
 - Larger rollout steps (2048) for more stable gradients
-- More workers (16) to maximize H100 utilization
-- Very long training (3.2M steps per worker) for proper convergence
+- 10 workers for stable barrier synchronization
+- Very long training (5.12M steps per worker) for proper convergence
 - Higher entropy coefficient (0.1) for better exploration with large action space
 """
 
@@ -46,9 +46,9 @@ PPO_KWARGS = {
 
 # Training Configuration
 TRAIN_KWARGS = {
-    # H100 80GB can handle 16 workers easily with large model
-    "num_workers": 16,  # 16 parallel workers for maximum throughput
-    "max_steps_per_worker": 3_200_000,  # 3.2M steps per worker = 51.2M total steps
+    # Reduced to 10 workers for more stable training (less barrier contention)
+    "num_workers": 10,  # 10 parallel workers - more stable than 16
+    "max_steps_per_worker": 5_120_000,  # 5.12M steps per worker = 51.2M total steps
     "save_every_steps": 204_800,  # Save every ~3.2M total steps (every 100 updates)
     "log_every_steps": 2_048,  # Log every rollout
     "eval_every_steps": 409_600,  # Evaluate every ~6.5M total steps
