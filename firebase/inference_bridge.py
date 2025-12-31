@@ -185,10 +185,10 @@ class InferenceBridge:
         if not self._validate_order(item_id, quantity, price, "sell"):
             return None
 
-        # Check if we have the item
-        holdings = self.portfolio_tracker.get_item_quantity(item_id)
-        if holdings < quantity:
-            logger.warning(f"Insufficient holdings for sell: have {holdings}, need {quantity}")
+        # Check if we have the item in inventory (what the bot can actually sell)
+        inventory_qty = self.get_inventory_item_quantity(item_id)
+        if inventory_qty < quantity:
+            logger.warning(f"Insufficient inventory for sell: have {inventory_qty}, need {quantity}")
             return None
 
         order_id = self.order_manager.create_sell_order(
@@ -265,6 +265,82 @@ class InferenceBridge:
         """Get count of active orders."""
         return len(self.get_active_orders())
 
+    def create_sell_orders_from_inventory(
+        self,
+        price_lookup: Optional[Callable[[int], int]] = None,
+        confidence: float = 0.0,
+        strategy: str = "ppo"
+    ) -> List[str]:
+        """
+        Create sell orders for all items currently in inventory.
+
+        Args:
+            price_lookup: Optional function that takes item_id and returns sell price.
+                         If not provided, uses the price_each from inventory data.
+            confidence: PPO confidence score for all orders
+            strategy: Strategy identifier
+
+        Returns:
+            List of created order IDs
+        """
+        inventory = self.portfolio_tracker.get_inventory()
+        if not inventory:
+            logger.warning("No inventory data available")
+            return []
+
+        items = inventory.get("items", {})
+        if not items:
+            logger.info("No items in inventory to sell")
+            return []
+
+        created_orders = []
+        available_slots = self.get_available_slots()
+
+        for item_id_str, item_data in items.items():
+            if available_slots <= 0:
+                logger.warning("No more GE slots available for sell orders")
+                break
+
+            try:
+                item_id = int(item_id_str)
+                item_name = item_data.get("item_name", f"Item #{item_id}")
+                quantity = item_data.get("quantity", 0)
+
+                if quantity <= 0:
+                    continue
+
+                # Determine price
+                if price_lookup:
+                    price = price_lookup(item_id)
+                else:
+                    price = item_data.get("price_each", 0)
+
+                if price <= 0:
+                    logger.warning(f"No valid price for {item_name}, skipping")
+                    continue
+
+                order_id = self.submit_sell_order(
+                    item_id=item_id,
+                    item_name=item_name,
+                    quantity=quantity,
+                    price=price,
+                    confidence=confidence,
+                    strategy=strategy,
+                    metadata={"source": "inventory_sell"}
+                )
+
+                if order_id:
+                    created_orders.append(order_id)
+                    available_slots -= 1
+                    logger.info(f"Created sell order for {quantity}x {item_name} @ {price}")
+
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Error processing inventory item {item_id_str}: {e}")
+                continue
+
+        logger.info(f"Created {len(created_orders)} sell orders from inventory")
+        return created_orders
+
     # =========================================================================
     # State Access
     # =========================================================================
@@ -280,6 +356,19 @@ class InferenceBridge:
     def get_item_quantity(self, item_id: int) -> int:
         """Get quantity of a specific item."""
         return self.portfolio_tracker.get_item_quantity(item_id)
+
+    def get_inventory_item_quantity(self, item_id: int) -> int:
+        """Get quantity of a specific item in inventory (what can be sold)."""
+        inventory = self.portfolio_tracker.get_inventory()
+        if inventory:
+            items = inventory.get("items", {})
+            item_data = items.get(str(item_id), {})
+            return item_data.get("quantity", 0)
+        return 0
+
+    def get_inventory_items(self) -> Dict[str, Dict[str, Any]]:
+        """Get all items currently in inventory."""
+        return self.portfolio_tracker.get_inventory_items()
 
     def get_available_slots(self) -> int:
         """Get number of available GE slots."""

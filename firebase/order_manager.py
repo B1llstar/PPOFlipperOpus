@@ -68,6 +68,7 @@ class OrderManager:
         self._status_listener = None
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
         self._status_callbacks: List[Callable[[str, str, Dict], None]] = []
+        self._initial_snapshot_received = False  # Track if we've received initial snapshot
 
     def _generate_order_id(self) -> str:
         """Generate a unique order ID."""
@@ -513,6 +514,8 @@ class OrderManager:
             return
 
         def on_snapshot(doc_snapshot, changes, read_time):
+            is_initial = not self._initial_snapshot_received
+
             for change in changes:
                 if change.type.name in ['ADDED', 'MODIFIED']:
                     order_data = change.document.to_dict()
@@ -529,9 +532,16 @@ class OrderManager:
                     self._pending_orders[order_id] = order_data
 
                     # Update positions when order completes
-                    if (self.track_positions and
+                    # Skip if this is the initial snapshot and order was already completed
+                    # (to avoid re-processing old completed orders on startup)
+                    should_update_position = (
+                        self.track_positions and
                         status == OrderStatus.COMPLETED.value and
-                        old_status != OrderStatus.COMPLETED.value):
+                        old_status != OrderStatus.COMPLETED.value and
+                        not (is_initial and change.type.name == 'ADDED')  # Skip initial completed orders
+                    )
+
+                    if should_update_position:
                         self._update_position_on_complete(
                             order_data,
                             order_data.get("filled_quantity")
@@ -544,6 +554,11 @@ class OrderManager:
                         except Exception as e:
                             logger.error(f"Error in status callback: {e}")
 
+            # Mark initial snapshot as received after processing all changes
+            if is_initial:
+                self._initial_snapshot_received = True
+                logger.info(f"Initial order snapshot received: {len(self._pending_orders)} orders")
+
         # Listen to all orders for this account
         self._status_listener = self.client.get_orders_ref().on_snapshot(on_snapshot)
         logger.info("Started order status listener")
@@ -553,6 +568,7 @@ class OrderManager:
         if self._status_listener:
             self._status_listener.unsubscribe()
             self._status_listener = None
+            self._initial_snapshot_received = False  # Reset for next startup
             logger.info("Stopped order status listener")
 
     def add_status_callback(self, callback: Callable[[str, str, Dict], None]):

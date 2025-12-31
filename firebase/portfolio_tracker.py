@@ -269,25 +269,41 @@ class PortfolioTracker:
         """Get the last heartbeat timestamp from plugin."""
         account = self.get_account()
         if account:
-            return account.get("last_heartbeat")
+            # Check multiple field names (matching dashboard logic)
+            heartbeat = (account.get("last_heartbeat") or
+                        account.get("lastHeartbeat") or
+                        account.get("plugin_heartbeat"))
+            return heartbeat
         return None
 
-    def is_plugin_online(self, max_age_seconds: int = 60) -> bool:
+    def is_plugin_online(self, max_age_seconds: int = 120) -> bool:
         """
         Check if the plugin is online (sent heartbeat recently).
 
         Args:
-            max_age_seconds: Maximum age of heartbeat to consider online
+            max_age_seconds: Maximum age of heartbeat to consider online (default 120s to match dashboard)
 
         Returns:
             True if plugin sent heartbeat within max_age_seconds
         """
+        account = self.get_account()
+        if account:
+            # Check explicit online flags first
+            if account.get("plugin_online") or account.get("pluginOnline") or account.get("online"):
+                return True
+
         heartbeat = self.get_last_heartbeat()
         if heartbeat is None:
             return False
 
         try:
-            heartbeat_time = datetime.fromisoformat(heartbeat.replace('Z', '+00:00'))
+            # Handle both string and Firestore Timestamp
+            if hasattr(heartbeat, 'isoformat'):
+                # It's already a datetime-like object
+                heartbeat_time = heartbeat
+            else:
+                heartbeat_time = datetime.fromisoformat(str(heartbeat).replace('Z', '+00:00'))
+
             age = (datetime.now(timezone.utc) - heartbeat_time).total_seconds()
             return age < max_age_seconds
         except Exception as e:
@@ -601,17 +617,25 @@ class PortfolioTracker:
         Returns:
             Dictionary with key state information
         """
-        portfolio = self.get_portfolio() or {}
+        # Use inventory as the primary source of truth (matches dashboard)
+        inventory = self.get_inventory() or {}
         account = self.get_account() or {}
 
+        # Get gold from inventory first, then account
+        gold = inventory.get("gold", 0)
+        if gold == 0:
+            gold = account.get("current_gold", 0)
+        if gold == 0:
+            gold = account.get("gold", 0)
+
         return {
-            "gold": portfolio.get("gold", 0),
-            "total_value": portfolio.get("total_value", 0),
-            "item_count": len(portfolio.get("items", {})),
-            "holdings": portfolio.get("items", {}),
+            "gold": gold,
+            "total_value": inventory.get("total_value", 0),
+            "item_count": len(inventory.get("items", {})),
+            "holdings": inventory.get("items", {}),
             "ge_slots_available": account.get("ge_slots_available", 0),
             "account_status": account.get("status", "unknown"),
             "plugin_online": self.is_plugin_online(),
             "last_heartbeat": account.get("last_heartbeat"),
-            "updated_at": portfolio.get("updated_at")
+            "updated_at": inventory.get("updated_at")
         }

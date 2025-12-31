@@ -37,6 +37,7 @@ class TradeMonitor:
         self._trade_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._recent_trades: List[Dict[str, Any]] = []
         self._max_recent_trades = 100
+        self._initial_snapshot_received = False  # Track if initial snapshot processed
 
     # =========================================================================
     # Trade Listening
@@ -57,10 +58,20 @@ class TradeMonitor:
             return
 
         def on_snapshot(doc_snapshot, changes, read_time):
+            is_initial = not self._initial_snapshot_received
+
             for change in changes:
                 if change.type.name == 'ADDED':
                     trade_data = change.document.to_dict()
-                    self._handle_new_trade(trade_data)
+                    # Only process new trades after initial snapshot
+                    # Skip historical trades on startup to avoid re-processing
+                    if not is_initial:
+                        self._handle_new_trade(trade_data)
+
+            # Mark initial snapshot as received
+            if is_initial:
+                self._initial_snapshot_received = True
+                logger.info(f"Initial trade snapshot received: {len(changes)} trades (skipped)")
 
         self._trade_listener = self.client.get_trades_ref().on_snapshot(on_snapshot)
         logger.info("Started trade monitor listener")
@@ -70,6 +81,7 @@ class TradeMonitor:
         if self._trade_listener:
             self._trade_listener.unsubscribe()
             self._trade_listener = None
+            self._initial_snapshot_received = False  # Reset for next startup
             logger.info("Stopped trade monitor listener")
 
     def _handle_new_trade(self, trade_data: Dict[str, Any]):

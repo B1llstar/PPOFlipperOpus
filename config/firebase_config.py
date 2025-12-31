@@ -19,10 +19,10 @@ PROJECT_ID = "ppoflipperopus"
 def get_service_account_path() -> str:
     """Find the service account JSON file."""
     possible_paths = [
-        # Root of PPOFlipperOpus
-        Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json",
+        # Root of PPOFlipperOpus (new service account)
+        Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
         # Config directory
-        Path(__file__).parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json",
+        Path(__file__).parent / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
         # Environment variable
         Path(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")),
         # User home
@@ -34,7 +34,7 @@ def get_service_account_path() -> str:
             return str(path)
 
     # Default to root location
-    return str(Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-0506134b11.json")
+    return str(Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json")
 
 
 SERVICE_ACCOUNT_PATH = get_service_account_path()
@@ -80,7 +80,7 @@ MAX_PENDING_ORDERS = 8
 MAX_OUTSTANDING_POSITIONS = 25
 
 # Minimum confidence threshold to execute a trade
-MIN_CONFIDENCE_THRESHOLD = 0.15  # Lowered for testing with early-stage model
+MIN_CONFIDENCE_THRESHOLD = 0.05  # Very low for early-stage model testing
 
 # Maximum value for a single order (gp)
 MAX_ORDER_VALUE = 10_000_000  # 10M

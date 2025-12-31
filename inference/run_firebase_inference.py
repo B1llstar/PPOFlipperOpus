@@ -430,10 +430,26 @@ class FirebaseInferenceRunner:
         self.stats["decisions_made"] += 1
         self.stats["last_decision_time"] = datetime.now(timezone.utc).isoformat()
 
-        # Get current state
-        portfolio = self.bridge.get_portfolio_summary()
-        gold = portfolio.get("gold", 0)
-        holdings = portfolio.get("holdings", {})
+        # Get current state - use inventory for positions (what we can sell)
+        inventory = self.bridge.portfolio_tracker.get_inventory()
+        inventory_items = inventory.get("items", {}) if inventory else {}
+
+        # Get gold from inventory first (most accurate), then fallback to other sources
+        gold = 0
+        if inventory:
+            gold = inventory.get("gold", 0)
+        if gold == 0:
+            gold = self.bridge.get_gold()
+
+        # Use inventory items as holdings (these are what the bot can actually trade)
+        holdings = {}
+        for item_id_str, item_data in inventory_items.items():
+            holdings[item_id_str] = {
+                'quantity': item_data.get('quantity', 0),
+                'price': item_data.get('price_each', 0)
+            }
+
+        logger.info(f"State: gold={gold:,}, inventory_items={len(holdings)}, items={list(holdings.keys())[:5]}")
 
         # Get active orders from Firebase
         active_orders = self.bridge.get_active_orders()
@@ -481,8 +497,10 @@ class FirebaseInferenceRunner:
 
         # Check confidence threshold
         if confidence < self.min_confidence:
-            logger.debug(f"Decision confidence {confidence:.2f} below threshold {self.min_confidence}")
+            logger.warning(f"[THRESHOLD-BLOCK] Decision BLOCKED: {action} confidence {confidence:.2f} < threshold {self.min_confidence} - NO ORDER CREATED")
             return
+
+        logger.info(f"[THRESHOLD-PASS] Decision ACCEPTED: {action} confidence {confidence:.2f} >= threshold {self.min_confidence} - CREATING ORDER")
 
         # Execute decision
         if action == "buy":
@@ -836,11 +854,39 @@ class FirebaseInferenceRunner:
             buy_limit = self.model_buy_limits.get(item_id, 5000)
             quantity_frac = quantity_bin / max(quantity_bins - 1, 1)
 
-            # Calculate quantity based on available gold and buy limit
+            # Calculate total portfolio value for position sizing
+            total_portfolio = gold
+            for h_id, h_data in holdings.items():
+                if isinstance(h_data, dict):
+                    h_qty = h_data.get('quantity', 0)
+                    h_price = h_data.get('price', 0)
+                    total_portfolio += h_qty * h_price
+
+            # 5% max position size per item
+            MAX_POSITION_PCT = 0.05
+            max_position_value = int(total_portfolio * MAX_POSITION_PCT)
+
+            # Calculate quantity based on available gold, buy limit, AND 5% portfolio cap
             if action == 'buy':
+                # Check current position value for this item
+                current_holding = holdings.get(str(item_id), {})
+                current_qty = current_holding.get('quantity', 0) if isinstance(current_holding, dict) else 0
+                current_value = current_qty * price
+
+                # How much more can we buy before hitting 5% cap?
+                remaining_allocation = max(0, max_position_value - current_value)
+                max_from_cap = remaining_allocation // max(price, 1)
+
+                if max_from_cap <= 0:
+                    logger.info(f"Skipping BUY {item_name} - already at 5% cap ({current_value:,}/{max_position_value:,})")
+                    return None
+
                 max_affordable = gold // max(price, 1)
-                max_quantity = min(buy_limit, max_affordable)
+                max_quantity = min(buy_limit, max_affordable, max_from_cap)
                 quantity = max(1, int(max_quantity * quantity_frac * 0.5))  # Use up to 50% of max
+
+                logger.debug(f"Position sizing: portfolio={total_portfolio:,}, 5%cap={max_position_value:,}, "
+                           f"current={current_value:,}, max_from_cap={max_from_cap}, qty={quantity}")
             else:
                 # For selling, check holdings - ONLY sell what we actually have
                 holding = holdings.get(str(item_id), {})
