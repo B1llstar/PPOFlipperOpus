@@ -6,6 +6,7 @@ This module handles the PPO → Plugin direction of communication:
 - Track order status
 - Cancel orders
 - Listen for status updates
+- Automatically update position tracking on order completion
 """
 
 import logging
@@ -17,6 +18,7 @@ from typing import Optional, Dict, List, Any, Callable
 from google.cloud.firestore_v1 import DocumentSnapshot
 
 from .firebase_client import FirebaseClient
+from .position_tracker import PositionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,23 @@ class OrderManager:
     Listens for status updates from the plugin.
     """
 
-    def __init__(self, client: Optional[FirebaseClient] = None):
-        """Initialize with Firebase client."""
+    def __init__(
+        self,
+        client: Optional[FirebaseClient] = None,
+        position_tracker: Optional[PositionTracker] = None,
+        track_positions: bool = True
+    ):
+        """
+        Initialize with Firebase client.
+
+        Args:
+            client: FirebaseClient instance
+            position_tracker: PositionTracker for tracking active positions
+            track_positions: If True, automatically updates positions on order completion
+        """
         self.client = client or FirebaseClient()
+        self.position_tracker = position_tracker or PositionTracker(self.client)
+        self.track_positions = track_positions
         self._status_listener = None
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
         self._status_callbacks: List[Callable[[str, str, Dict], None]] = []
@@ -399,7 +415,7 @@ class OrderManager:
     def complete_order(self, order_id: str, filled_quantity: int = None,
                        total_cost: int = None, metadata: Dict[str, Any] = None) -> bool:
         """
-        Mark an order as completed.
+        Mark an order as completed and update position tracking.
 
         Args:
             order_id: The order ID to complete
@@ -418,6 +434,8 @@ class OrderManager:
                 logger.warning(f"Order {order_id} not found for completion")
                 return False
 
+            order_data = doc.to_dict()
+
             update_data = {
                 "status": OrderStatus.COMPLETED.value,
                 "completed_at": self._now_iso(),
@@ -433,11 +451,48 @@ class OrderManager:
 
             doc_ref.update(update_data)
             logger.info(f"Marked order as completed: {order_id}")
+
+            # Update position tracking
+            if self.track_positions and self.position_tracker:
+                self._update_position_on_complete(order_data, filled_quantity)
+
             return True
 
         except Exception as e:
             logger.error(f"Failed to complete order {order_id}: {e}")
             return False
+
+    def _update_position_on_complete(self, order_data: Dict[str, Any], filled_quantity: Optional[int] = None):
+        """Update position tracking when an order completes."""
+        try:
+            action = order_data.get("action")
+            item_id = order_data.get("item_id")
+            item_name = order_data.get("item_name", f"Item {item_id}")
+            quantity = filled_quantity or order_data.get("quantity", 0)
+            price = order_data.get("price", 0)
+
+            if action == OrderAction.BUY.value:
+                # Add to positions
+                self.position_tracker.add_position(
+                    item_id=item_id,
+                    item_name=item_name,
+                    quantity=quantity,
+                    cost_per_item=price,
+                    source="ppo"
+                )
+                logger.info(f"Position added: {quantity}x {item_name}")
+
+            elif action == OrderAction.SELL.value:
+                # Reduce position
+                self.position_tracker.reduce_position(
+                    item_id=item_id,
+                    quantity=quantity,
+                    sale_price=price
+                )
+                logger.info(f"Position reduced: {quantity}x {item_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to update position on complete: {e}")
 
     # =========================================================================
     # Status Listening
@@ -465,12 +520,22 @@ class OrderManager:
                     status = order_data.get("status")
 
                     # Update local tracking
+                    old_status = None
                     if order_id in self._pending_orders:
                         old_status = self._pending_orders[order_id].get("status")
                         if old_status != status:
                             logger.info(f"Order {order_id} status: {old_status} → {status}")
 
                     self._pending_orders[order_id] = order_data
+
+                    # Update positions when order completes
+                    if (self.track_positions and
+                        status == OrderStatus.COMPLETED.value and
+                        old_status != OrderStatus.COMPLETED.value):
+                        self._update_position_on_complete(
+                            order_data,
+                            order_data.get("filled_quantity")
+                        )
 
                     # Notify callbacks
                     for cb in self._status_callbacks:

@@ -10,6 +10,9 @@ Components:
     - TradeMonitor: Listen for completed trades
     - PortfolioTracker: Track account portfolio state
     - InferenceBridge: Main orchestrator for PPO → Firebase → Plugin
+    - InventoryScanner: Scan items and get full inventory accounting
+    - PositionSizer: Enforce position limits (max % per item)
+    - PositionTracker: Track active positions acquired by PPO
 """
 
 from .firebase_client import FirebaseClient
@@ -17,6 +20,9 @@ from .order_manager import OrderManager, OrderStatus, OrderAction
 from .trade_monitor import TradeMonitor
 from .portfolio_tracker import PortfolioTracker
 from .inference_bridge import InferenceBridge
+from .inventory_scanner import InventoryScanner
+from .position_sizer import PositionSizer
+from .position_tracker import PositionTracker
 
 __all__ = [
     'FirebaseClient',
@@ -26,4 +32,7 @@ __all__ = [
     'TradeMonitor',
     'PortfolioTracker',
     'InferenceBridge',
+    'InventoryScanner',
+    'PositionSizer',
+    'PositionTracker',
 ]
