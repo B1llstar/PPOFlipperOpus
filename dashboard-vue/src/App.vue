@@ -6,15 +6,16 @@ import HoldingsTable from './components/HoldingsTable.vue'
 import OrdersTable from './components/OrdersTable.vue'
 import TradesTable from './components/TradesTable.vue'
 import StatsCard from './components/StatsCard.vue'
+import PositionsTable from './components/PositionsTable.vue'
 
 const store = useTradingStore()
 
 onMounted(() => {
-  store.startAutoRefresh(5000) // Refresh every 5 seconds
+  store.connect() // Connect to Firestore with real-time listeners
 })
 
 onUnmounted(() => {
-  store.stopAutoRefresh()
+  store.disconnect()
 })
 </script>
 
@@ -32,6 +33,7 @@ onUnmounted(() => {
 
     <main class="main-content">
       <div class="left-column">
+        <PositionsTable />
         <HoldingsTable />
         <StatsCard />
       </div>

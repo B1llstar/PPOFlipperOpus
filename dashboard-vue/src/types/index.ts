@@ -71,3 +71,36 @@ export interface Inventory {
   items?: Record<string, number>
   last_updated?: string
 }
+
+export interface Position {
+  id: string
+  item_id: number
+  item_name: string
+  quantity: number
+  avg_cost: number
+  total_invested: number
+  first_acquired: string
+  last_updated: string
+  source: 'ppo' | 'manual'
+  locked: boolean
+}
+
+export interface BankItem {
+  id: string
+  item_id: number
+  item_name: string
+  quantity: number
+  price_each: number
+  total_value: number
+  is_tradeable: boolean
+}
+
+export interface GESlot {
+  item_id: number
+  item_name: string
+  type: 'buy' | 'sell'
+  status: 'active' | 'empty' | 'completed'
+  quantity: number
+  filled_quantity: number
+  price: number
+}

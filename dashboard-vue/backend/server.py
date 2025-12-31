@@ -343,6 +343,213 @@ def health_check():
     })
 
 
+# =========================================================================
+# Position Management Endpoints
+# =========================================================================
+
+@app.route('/api/positions')
+def get_positions():
+    """Get all active positions (PPO-acquired tradeable items)."""
+    try:
+        db = get_db()
+        positions_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("positions").document("active")
+        positions_doc = positions_ref.get()
+
+        if positions_doc.exists:
+            data = positions_doc.to_dict()
+            items = data.get("items", {})
+
+            # Convert to list format
+            positions = []
+            for item_id, pos_data in items.items():
+                pos_data["id"] = item_id
+                positions.append(pos_data)
+
+            # Sort by total_invested descending
+            positions.sort(key=lambda x: x.get("total_invested", 0), reverse=True)
+
+            return jsonify({
+                "success": True,
+                "positions": positions,
+                "count": len(positions),
+                "updated_at": data.get("updated_at")
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "positions": [],
+                "count": 0
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/positions/<item_id>/lock', methods=['POST'])
+def lock_position(item_id):
+    """Lock a position to prevent PPO from selling it."""
+    try:
+        db = get_db()
+        positions_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("positions").document("active")
+        positions_doc = positions_ref.get()
+
+        if not positions_doc.exists:
+            return jsonify({"success": False, "error": "No positions found"})
+
+        data = positions_doc.to_dict()
+        items = data.get("items", {})
+
+        if item_id not in items:
+            return jsonify({"success": False, "error": f"Position {item_id} not found"})
+
+        items[item_id]["locked"] = True
+        items[item_id]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        positions_ref.update({
+            "items": items,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+        return jsonify({
+            "success": True,
+            "message": f"Position {item_id} locked"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/positions/<item_id>/unlock', methods=['POST'])
+def unlock_position(item_id):
+    """Unlock a position to allow PPO to sell it."""
+    try:
+        db = get_db()
+        positions_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("positions").document("active")
+        positions_doc = positions_ref.get()
+
+        if not positions_doc.exists:
+            return jsonify({"success": False, "error": "No positions found"})
+
+        data = positions_doc.to_dict()
+        items = data.get("items", {})
+
+        if item_id not in items:
+            return jsonify({"success": False, "error": f"Position {item_id} not found"})
+
+        items[item_id]["locked"] = False
+        items[item_id]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        positions_ref.update({
+            "items": items,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+        return jsonify({
+            "success": True,
+            "message": f"Position {item_id} unlocked"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/positions/<item_id>', methods=['DELETE'])
+def remove_position(item_id):
+    """Remove a position from the active positions list."""
+    try:
+        db = get_db()
+        positions_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("positions").document("active")
+        positions_doc = positions_ref.get()
+
+        if not positions_doc.exists:
+            return jsonify({"success": False, "error": "No positions found"})
+
+        data = positions_doc.to_dict()
+        items = data.get("items", {})
+
+        if item_id not in items:
+            return jsonify({"success": False, "error": f"Position {item_id} not found"})
+
+        item_name = items[item_id].get("item_name", f"Item {item_id}")
+        del items[item_id]
+
+        positions_ref.set({
+            "items": items,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+        return jsonify({
+            "success": True,
+            "message": f"Position {item_name} removed"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/bank')
+def get_bank():
+    """Get bank contents from last sync."""
+    try:
+        db = get_db()
+        bank_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("bank").document("current")
+        bank_doc = bank_ref.get()
+
+        if bank_doc.exists:
+            data = bank_doc.to_dict()
+            items = data.get("items", {})
+
+            # Convert to list
+            bank_items = []
+            for item_id, item_data in items.items():
+                item_data["id"] = item_id
+                bank_items.append(item_data)
+
+            # Sort by total_value descending
+            bank_items.sort(key=lambda x: x.get("total_value", 0), reverse=True)
+
+            return jsonify({
+                "success": True,
+                "bank": bank_items,
+                "total_value": data.get("total_value", 0),
+                "item_count": data.get("item_count", len(bank_items)),
+                "updated_at": data.get("updated_at")
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "bank": [],
+                "total_value": 0,
+                "item_count": 0
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/ge-slots')
+def get_ge_slots():
+    """Get GE slot states from last sync."""
+    try:
+        db = get_db()
+        ge_ref = db.collection("accounts").document(DEFAULT_ACCOUNT_ID).collection("ge_slots").document("current")
+        ge_doc = ge_ref.get()
+
+        if ge_doc.exists:
+            data = ge_doc.to_dict()
+            return jsonify({
+                "success": True,
+                "slots": data.get("slots", {}),
+                "slots_available": data.get("slots_available", 0),
+                "buy_slots_used": data.get("buy_slots_used", 0),
+                "sell_slots_used": data.get("sell_slots_used", 0),
+                "updated_at": data.get("updated_at")
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "slots": {},
+                "slots_available": 8
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("PPO Flipper Dashboard API Server")

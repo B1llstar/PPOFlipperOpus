@@ -4,6 +4,8 @@ import { useTradingStore } from '../stores/trading'
 
 const store = useTradingStore()
 const showAll = ref(false)
+const cancellingOrder = ref<string | null>(null)
+const cancellingAll = ref(false)
 
 const formatGold = (value: number) => {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`
@@ -24,6 +26,10 @@ const displayedOrders = computed(() => {
   return store.activeOrders
 })
 
+const isActiveStatus = (status: string) => {
+  return ['pending', 'received', 'placed', 'active'].includes(status)
+}
+
 const getStatusClass = (status: string) => {
   switch (status) {
     case 'completed': return 'status-completed'
@@ -39,6 +45,28 @@ const getStatusClass = (status: string) => {
 
 const getTypeClass = (type: string) => {
   return type === 'buy' ? 'type-buy' : 'type-sell'
+}
+
+async function handleCancelOrder(orderId: string) {
+  cancellingOrder.value = orderId
+  try {
+    await store.cancelOrder(orderId)
+  } finally {
+    cancellingOrder.value = null
+  }
+}
+
+async function handleCancelAll() {
+  if (!confirm(`Cancel all ${store.activeOrders.length} active orders?`)) {
+    return
+  }
+  cancellingAll.value = true
+  try {
+    const count = await store.cancelAllActiveOrders()
+    console.log(`Cancelled ${count} orders`)
+  } finally {
+    cancellingAll.value = false
+  }
 }
 </script>
 
@@ -59,6 +87,14 @@ const getTypeClass = (type: string) => {
         >
           All ({{ store.orders.length }})
         </button>
+        <button
+          v-if="store.activeOrders.length > 0"
+          class="btn-cancel-all"
+          @click="handleCancelAll"
+          :disabled="cancellingAll"
+        >
+          {{ cancellingAll ? 'Cancelling...' : 'Cancel All' }}
+        </button>
       </div>
     </div>
 
@@ -73,6 +109,7 @@ const getTypeClass = (type: string) => {
             <th class="right">Value</th>
             <th>Status</th>
             <th>Time</th>
+            <th class="center">Action</th>
           </tr>
         </thead>
         <tbody>
@@ -92,6 +129,17 @@ const getTypeClass = (type: string) => {
               </span>
             </td>
             <td class="time">{{ formatTime(order.created_at) }}</td>
+            <td class="center">
+              <button
+                v-if="isActiveStatus(order.status)"
+                class="btn-cancel"
+                @click="handleCancelOrder(order.id)"
+                :disabled="cancellingOrder === order.id"
+              >
+                {{ cancellingOrder === order.id ? '...' : 'X' }}
+              </button>
+              <span v-else class="no-action">-</span>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -242,6 +290,56 @@ td {
 
 tr:hover td {
   background: rgba(15, 52, 96, 0.3);
+}
+
+.center {
+  text-align: center;
+}
+
+.btn-cancel-all {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #ef4444;
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.btn-cancel-all:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.4);
+}
+
+.btn-cancel-all:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-cancel {
+  padding: 0.25rem 0.5rem;
+  border: none;
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.btn-cancel:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.4);
+}
+
+.btn-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.no-action {
+  color: #444;
 }
 
 .empty {
