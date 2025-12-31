@@ -756,8 +756,11 @@ def worker_process(
         logger.info(f"  Total Steps: {step}")
         logger.info(f"  Total Episodes: {episode}")
         logger.info(f"  Total Time: {total_time/60:.1f} minutes")
-        logger.info(f"  Avg Speed: {step/total_time:.1f} steps/sec")
-        logger.info(f"  Final checkpoint: {final_path.name}")
+        logger.info(f"  Avg Speed: {step/max(total_time, 0.001):.1f} steps/sec")
+        if shared_model is None:
+            logger.info(f"  Final checkpoint: {final_path.name}")
+        else:
+            logger.info(f"  Checkpoints: managed by coordinator")
         logger.info("="*60)
         
     except Exception as e:
