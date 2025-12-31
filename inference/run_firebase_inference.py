@@ -281,13 +281,15 @@ class FirebaseInferenceRunner:
             from ppo_agent import FeatureExtractor, ActorHead, CriticHead
 
             # Create network components with the same architecture as training
-            hidden_size = self.model_config.get('hidden_size', 256)
-            num_layers = self.model_config.get('num_layers', 3)
-            obs_dim = self.model_config.get('obs_dim', 1407)
-            n_items = self.model_config.get('n_items', 200)
-            price_bins = self.model_config.get('price_bins', 21)
-            quantity_bins = self.model_config.get('quantity_bins', 11)
-            wait_steps_bins = self.model_config.get('wait_steps_bins', 5)
+            hidden_size = self.model_config.get('hidden_size', 1024)
+            num_layers = self.model_config.get('num_layers', 4)
+            n_items = self.model_config.get('n_items', len(self.item_list))
+            # obs_dim = n_items * 13 (per-item) + 6 (portfolio) + 4 (time)
+            default_obs_dim = n_items * 13 + 6 + 4
+            obs_dim = self.model_config.get('obs_dim', default_obs_dim)
+            price_bins = self.model_config.get('price_bins', 20)
+            quantity_bins = self.model_config.get('quantity_bins', 10)
+            wait_steps_bins = self.model_config.get('wait_steps_bins', 10)
 
             self.feature_extractor = FeatureExtractor(
                 input_dim=obs_dim,
@@ -618,14 +620,29 @@ class FirebaseInferenceRunner:
         market_data: Dict[str, Any]
     ) -> np.ndarray:
         """
-        Build observation vector matching the training environment format.
+        Build observation vector MATCHING THE TRAINING ENVIRONMENT FORMAT EXACTLY.
 
-        Per item: price (2), volume (2), spread (1), position (2) = 7 features
-        Portfolio: cash, value, pnl = 3 features
+        Training environment (ge_environment.py) uses:
+        Per item: 13 features
+            - Current market: high, low, spread_pct, high_vol (log), low_vol (log), vol_ratio = 6
+            - Rolling stats: sma_6, sma_24, vol_sma (log), volatility = 4
+            - Position: quantity (log), avg_cost (normalized), unrealized_pnl_pct = 3
+        Portfolio: 6 features
+            - log_cash/20, log_total_value/20, realized_pnl_ratio, unrealized_pnl_ratio,
+              position_count_ratio, concentration
         Time: 4 cyclical features
+            - sin/cos hour, sin/cos day
+
+        Total: n_items * 13 + 6 + 4 = 200 * 13 + 10 = 2610
         """
-        obs_dim = self.model_config.get('obs_dim', 1407)
         n_items = len(self.item_list)
+        per_item_features = 13
+        portfolio_features = 6
+        time_features = 4
+
+        # Calculate expected obs_dim to match training
+        expected_obs_dim = n_items * per_item_features + portfolio_features + time_features
+        obs_dim = self.model_config.get('obs_dim', expected_obs_dim)
 
         # Initialize observation array
         obs = np.zeros(obs_dim, dtype=np.float32)
@@ -633,82 +650,125 @@ class FirebaseInferenceRunner:
         latest = market_data.get("latest", {})
         volume = market_data.get("volume", {})
 
-        # Build per-item features
+        # Track portfolio stats
+        total_value = gold
+        unrealized_pnl = 0.0
+        n_positions = 0
+        position_values = []
+
+        # Build per-item features (13 per item)
         idx = 0
         for item_id in self.item_list:
             item_id_str = str(item_id)
 
             # Get price data
             price_data = latest.get(item_id_str, {})
-            high_price = price_data.get('high', 0)
-            low_price = price_data.get('low', 0)
+            high_price = float(price_data.get('high', 0))
+            low_price = float(price_data.get('low', 0))
+            mid_price = (high_price + low_price) / 2 if (high_price + low_price) > 0 else 1.0
+            price_scale = mid_price if mid_price > 0 else 1.0
 
             # Get volume data
             vol_data = volume.get(item_id_str, {})
-            high_vol = vol_data.get('high_volume', 0)
-            low_vol = vol_data.get('low_volume', 0)
-
-            # Normalize prices (log scale for better learning)
-            norm_high = np.log1p(high_price) / 15.0 if high_price > 0 else 0
-            norm_low = np.log1p(low_price) / 15.0 if low_price > 0 else 0
-
-            # Normalize volumes (log scale)
-            norm_high_vol = np.log1p(high_vol) / 15.0 if high_vol > 0 else 0
-            norm_low_vol = np.log1p(low_vol) / 15.0 if low_vol > 0 else 0
-
-            # Calculate spread
-            spread = (high_price - low_price) / max(low_price, 1) if low_price > 0 else 0
-            spread = min(spread, 1.0)  # Cap at 100% spread
+            high_vol = float(vol_data.get('high_volume', 0))
+            low_vol = float(vol_data.get('low_volume', 0))
 
             # Get position for this item
             holding = holdings.get(item_id_str, {})
             position_qty = holding.get('quantity', 0) if isinstance(holding, dict) else 0
-            position_value = position_qty * high_price if high_price > 0 else 0
+            position_avg_cost = holding.get('avg_cost', holding.get('price', 0)) if isinstance(holding, dict) else 0
+            position_value = position_qty * low_price
 
-            # Normalize position
-            norm_qty = np.log1p(position_qty) / 15.0
-            norm_value = np.log1p(position_value) / 20.0
+            # Track portfolio stats
+            if position_qty > 0:
+                n_positions += 1
+                total_value += position_value
+                position_values.append(position_value)
+                if position_avg_cost > 0:
+                    unrealized_pnl += position_value - (position_qty * position_avg_cost)
 
-            # Store features for this item
-            if idx + 7 <= obs_dim:
-                obs[idx] = norm_high
-                obs[idx + 1] = norm_low
-                obs[idx + 2] = norm_high_vol
-                obs[idx + 3] = norm_low_vol
-                obs[idx + 4] = spread
-                obs[idx + 5] = norm_qty
-                obs[idx + 6] = norm_value
+            # === 13 FEATURES PER ITEM (matching training exactly) ===
 
-            idx += 7
+            # Feature 1-2: Normalized high/low prices
+            obs[idx] = high_price / price_scale if price_scale > 0 else 0
+            obs[idx + 1] = low_price / price_scale if price_scale > 0 else 0
 
-        # Portfolio features
-        portfolio_start = n_items * 7
-        if portfolio_start + 3 <= obs_dim:
-            # Cash normalized
-            obs[portfolio_start] = np.log1p(gold) / 25.0
-            # Portfolio value estimate
-            total_value = gold
-            for item_id_str, holding in holdings.items():
-                if isinstance(holding, dict):
-                    qty = holding.get('quantity', 0)
-                    price_data = latest.get(item_id_str, {})
-                    price = price_data.get('high', 0)
-                    total_value += qty * price
-            obs[portfolio_start + 1] = np.log1p(total_value) / 25.0
-            # PnL (just use 0 since we don't track it here)
-            obs[portfolio_start + 2] = 0
+            # Feature 3: Spread percentage
+            spread_pct = (high_price - low_price) / price_scale if price_scale > 0 else 0
+            obs[idx + 2] = np.clip(spread_pct, 0, 1)
 
-        # Time features (cyclical encoding)
-        time_start = portfolio_start + 3
-        if time_start + 4 <= obs_dim:
-            now = datetime.now()
-            hour = now.hour
-            day = now.weekday()
-            # Cyclical encoding
-            obs[time_start] = np.sin(2 * np.pi * hour / 24)
-            obs[time_start + 1] = np.cos(2 * np.pi * hour / 24)
-            obs[time_start + 2] = np.sin(2 * np.pi * day / 7)
-            obs[time_start + 3] = np.cos(2 * np.pi * day / 7)
+            # Feature 4-5: Log volumes
+            obs[idx + 3] = np.log1p(high_vol)
+            obs[idx + 4] = np.log1p(low_vol)
+
+            # Feature 6: Volume ratio
+            vol_ratio = high_vol / max(low_vol, 1)
+            obs[idx + 5] = np.clip(vol_ratio, 0.1, 10)
+
+            # Features 7-10: Rolling statistics
+            # Since we don't have historical data in inference, use reasonable defaults
+            # sma_6 and sma_24 normalized by price_scale - assume current price is the average
+            obs[idx + 6] = 1.0  # sma_6 / price_scale ≈ 1.0 (current price)
+            obs[idx + 7] = 1.0  # sma_24 / price_scale ≈ 1.0 (current price)
+            # vol_sma (log) - use current total volume as estimate
+            obs[idx + 8] = np.log1p((high_vol + low_vol) / 2)
+            # volatility - assume low volatility (0.02 = 2%)
+            obs[idx + 9] = 0.02
+
+            # Features 11-13: Position features
+            obs[idx + 10] = np.log1p(position_qty)  # Log quantity
+
+            if position_qty > 0 and position_avg_cost > 0:
+                obs[idx + 11] = position_avg_cost / price_scale  # Normalized avg cost
+                unrealized_pnl_pct = (low_price - position_avg_cost) / position_avg_cost
+                obs[idx + 12] = np.clip(unrealized_pnl_pct, -0.5, 0.5)  # Unrealized P&L %
+            else:
+                obs[idx + 11] = 0.0
+                obs[idx + 12] = 0.0
+
+            idx += per_item_features
+
+        # === PORTFOLIO FEATURES (6) ===
+        portfolio_start = n_items * per_item_features
+
+        # 1. Normalized log cash
+        obs[portfolio_start] = np.log1p(gold) / 20.0
+
+        # 2. Normalized log total value
+        obs[portfolio_start + 1] = np.log1p(total_value) / 20.0
+
+        # 3. Realized P&L ratio (we don't track this, use 0)
+        obs[portfolio_start + 2] = 0.0
+
+        # 4. Unrealized P&L ratio
+        initial_cash = 1_000_000  # Assume same as training
+        obs[portfolio_start + 3] = unrealized_pnl / initial_cash
+
+        # 5. Position count ratio
+        obs[portfolio_start + 4] = n_positions / n_items
+
+        # 6. Concentration (Herfindahl index)
+        if position_values:
+            total_pos_value = sum(position_values)
+            if total_pos_value > 0:
+                shares = [v / total_pos_value for v in position_values]
+                concentration = sum(s * s for s in shares)
+            else:
+                concentration = 0
+        else:
+            concentration = 0
+        obs[portfolio_start + 5] = concentration
+
+        # === TIME FEATURES (4) ===
+        time_start = portfolio_start + portfolio_features
+        now = datetime.now()
+        hour = now.hour
+        day = now.weekday()
+
+        obs[time_start] = np.sin(2 * np.pi * hour / 24)
+        obs[time_start + 1] = np.cos(2 * np.pi * hour / 24)
+        obs[time_start + 2] = np.sin(2 * np.pi * day / 7)
+        obs[time_start + 3] = np.cos(2 * np.pi * day / 7)
 
         return obs
 
@@ -883,7 +943,8 @@ class FirebaseInferenceRunner:
 
                 max_affordable = gold // max(price, 1)
                 max_quantity = min(buy_limit, max_affordable, max_from_cap)
-                quantity = max(1, int(max_quantity * quantity_frac * 0.5))  # Use up to 50% of max
+                # Use quantity_frac directly - model learned this distribution
+                quantity = max(1, int(max_quantity * quantity_frac))
 
                 logger.debug(f"Position sizing: portfolio={total_portfolio:,}, 5%cap={max_position_value:,}, "
                            f"current={current_value:,}, max_from_cap={max_from_cap}, qty={quantity}")
@@ -896,8 +957,8 @@ class FirebaseInferenceRunner:
                     logger.info(f"Skipping SELL {item_name} - no holdings (qty: {available_qty})")
                     return None
 
-                # Sell between 10% and 100% of holdings based on quantity_frac
-                quantity = max(1, int(available_qty * (0.1 + 0.9 * quantity_frac)))
+                # Use quantity_frac directly - model learned this distribution
+                quantity = max(1, int(available_qty * quantity_frac))
                 # Never sell more than we have
                 quantity = min(quantity, available_qty)
 

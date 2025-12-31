@@ -765,14 +765,23 @@ class GrandExchangeEnv(gym.Env):
             )
 
     def _calculate_reward(self, step_pnl: float, trades: List[TradeResult]) -> float:
-        """Calculate reward for the step."""
+        """
+        Calculate reward for the step with dense shaping signals.
+
+        Reward components:
+        1. Realized P&L (main signal) - scaled for learning
+        2. Unrealized P&L change - encourages good position building
+        3. Spread capture bonus - rewards buying low, selling high
+        4. Volume-based opportunity cost - encourages trading liquid items
+        5. Hold penalty - small cost to encourage active trading
+        """
         reward = 0.0
 
-        # Primary reward: realized P&L (normalized)
-        reward += step_pnl / self.initial_cash * 100  # Scale up for learning
+        # 1. Primary reward: realized P&L (normalized and scaled)
+        if step_pnl != 0:
+            reward += step_pnl / self.initial_cash * 100  # Scale up for learning
 
-        # Secondary: unrealized P&L change (smaller weight)
-        # This encourages building positions in good opportunities
+        # 2. Unrealized P&L change - encourages building profitable positions
         unrealized = 0.0
         for item_id, position in self.positions.items():
             if position.quantity > 0:
@@ -783,9 +792,35 @@ class GrandExchangeEnv(gym.Env):
 
         reward += unrealized / self.initial_cash * 10  # Lower weight
 
-        # Small penalty for excessive trading (transaction costs already in P&L)
+        # 3. Spread capture bonus - reward for good price execution
+        for trade in trades:
+            if trade.success:
+                state = self._get_market_state(trade.item_id, self.current_timestamp)
+                if state and state.high_price > 0 and state.low_price > 0:
+                    spread = state.high_price - state.low_price
+                    mid_price = (state.high_price + state.low_price) / 2
+
+                    if spread > 0:
+                        if trade.action == 'buy':
+                            # Reward buying below mid price
+                            price_advantage = (mid_price - trade.price) / spread
+                            reward += max(0, price_advantage) * 0.5
+                        elif trade.action == 'sell':
+                            # Reward selling above mid price
+                            price_advantage = (trade.price - mid_price) / spread
+                            reward += max(0, price_advantage) * 0.5
+
+        # 4. Successful trade bonus - encourage completing trades
+        successful_trades = sum(1 for t in trades if t.success)
+        reward += successful_trades * 0.1
+
+        # 5. Small penalty for doing nothing (encourages exploration)
+        if len(trades) == 0:
+            reward -= 0.01
+
+        # 6. Penalty for excessive trading (transaction costs already in P&L)
         if len(trades) > 5:
-            reward -= 0.01 * (len(trades) - 5)
+            reward -= 0.02 * (len(trades) - 5)
 
         return reward
 

@@ -372,12 +372,18 @@ class PPOAgent:
         # Risk tolerance varies per agent for diversity
         self.risk_tolerance = 0.3 + random.random() * 0.4  # 0.3 to 0.7
 
-        # Calculate observation dimension
-        # Per item: price (2), volume (2), spread (1), position (2) = 7
-        # Portfolio: cash, value, pnl = 3
-        # Time: 4 cyclical features
+        # Calculate observation dimension (MUST MATCH ge_environment.py)
+        # Per item: 13 features
+        #   - Current market: high, low, spread_pct, high_vol, low_vol, vol_ratio = 6
+        #   - Rolling stats: sma_6, sma_24, vol_sma, volatility = 4
+        #   - Position: quantity, avg_cost, unrealized_pnl_pct = 3
+        # Portfolio: 6 features (cash, value, realized_pnl, unrealized_pnl, position_count, concentration)
+        # Time: 4 cyclical features (sin/cos hour, sin/cos day)
         self.n_items = len(item_list)
-        self.obs_dim = max(1, self.n_items * 7 + 3 + 4)
+        per_item_features = 13
+        portfolio_features = 6
+        time_features = 4
+        self.obs_dim = max(1, self.n_items * per_item_features + portfolio_features + time_features)
 
         # Create networks
         self.feature_extractor = FeatureExtractor(
@@ -793,7 +799,9 @@ class PPOAgent:
         """
         Compute gradients from collected rollout WITHOUT applying optimizer step.
         For use in distributed training where gradients are aggregated externally.
-        
+
+        FIXED: Now properly averages gradients across batches instead of accumulating.
+
         Returns dict of training metrics (same as update()).
         """
         # Compute final value for GAE
@@ -815,12 +823,16 @@ class PPOAgent:
         all_entropy_losses = []
         all_clip_fractions = []
 
-        # Zero out any existing gradients
-        self.optimizer.zero_grad()
+        # Accumulate gradients properly by averaging across all batches
+        accumulated_grads = {}
+        num_batches = 0
 
         # Multiple epochs over the data
         for epoch in range(n_epochs):
             for batch in self.buffer.get_batches(batch_size):
+                # Zero gradients for this batch
+                self.optimizer.zero_grad()
+
                 # Get observations
                 obs = batch["observations"]
                 action_types = batch["action_types"]
@@ -862,8 +874,35 @@ class PPOAgent:
                 # Total loss
                 loss = pg_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
 
-                # Backward pass (accumulate gradients)
+                # Backward pass for this batch
                 loss.backward()
+
+                # Accumulate gradients (we'll average later)
+                for name, param in self.feature_extractor.named_parameters():
+                    if param.grad is not None:
+                        key = f'feature_extractor.{name}'
+                        if key not in accumulated_grads:
+                            accumulated_grads[key] = param.grad.clone()
+                        else:
+                            accumulated_grads[key] += param.grad
+
+                for name, param in self.actor.named_parameters():
+                    if param.grad is not None:
+                        key = f'actor.{name}'
+                        if key not in accumulated_grads:
+                            accumulated_grads[key] = param.grad.clone()
+                        else:
+                            accumulated_grads[key] += param.grad
+
+                for name, param in self.critic.named_parameters():
+                    if param.grad is not None:
+                        key = f'critic.{name}'
+                        if key not in accumulated_grads:
+                            accumulated_grads[key] = param.grad.clone()
+                        else:
+                            accumulated_grads[key] += param.grad
+
+                num_batches += 1
 
                 # Metrics
                 with torch.no_grad():
@@ -875,7 +914,24 @@ class PPOAgent:
                 all_entropy_losses.append(entropy_loss.item())
                 all_clip_fractions.append(clip_fraction)
 
-        # Clip accumulated gradients
+        # Average the accumulated gradients and set them on the parameters
+        self.optimizer.zero_grad()
+        for name, param in self.feature_extractor.named_parameters():
+            key = f'feature_extractor.{name}'
+            if key in accumulated_grads:
+                param.grad = accumulated_grads[key] / num_batches
+
+        for name, param in self.actor.named_parameters():
+            key = f'actor.{name}'
+            if key in accumulated_grads:
+                param.grad = accumulated_grads[key] / num_batches
+
+        for name, param in self.critic.named_parameters():
+            key = f'critic.{name}'
+            if key in accumulated_grads:
+                param.grad = accumulated_grads[key] / num_batches
+
+        # Clip averaged gradients
         nn.utils.clip_grad_norm_(self.all_parameters, self.max_grad_norm)
 
         self.n_updates += 1

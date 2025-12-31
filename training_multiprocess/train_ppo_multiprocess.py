@@ -14,11 +14,20 @@ import sys
 import logging
 import time
 import signal
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 from collections import deque
 from tqdm import tqdm
+
+# Firebase imports for async checkpoint upload
+try:
+    import firebase_admin
+    from firebase_admin import credentials, storage
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +35,97 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training_multiprocess.ppo_config_multiprocess import ENV_KWARGS, PPO_KWARGS, TRAIN_KWARGS, EVAL_KWARGS
 from ppo_agent import PPOAgent
 from training.ge_environment import GrandExchangeEnv
+
+# Global Firebase Storage bucket reference (initialized once)
+_firebase_bucket = None
+_firebase_init_lock = threading.Lock()
+
+
+def init_firebase_storage(logger: logging.Logger) -> bool:
+    """
+    Initialize Firebase Storage for checkpoint uploads.
+
+    Returns:
+        True if initialization successful, False otherwise
+    """
+    global _firebase_bucket
+
+    if not FIREBASE_AVAILABLE:
+        logger.warning("Firebase SDK not installed. Checkpoints will only be saved locally.")
+        return False
+
+    with _firebase_init_lock:
+        if _firebase_bucket is not None:
+            return True  # Already initialized
+
+        try:
+            # Find service account file
+            service_account_paths = [
+                Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
+                Path(__file__).parent.parent / "config" / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
+                Path(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")),
+            ]
+
+            service_account_path = None
+            for path in service_account_paths:
+                if path.exists():
+                    service_account_path = path
+                    break
+
+            if service_account_path is None:
+                logger.warning("Firebase service account file not found. Checkpoints will only be saved locally.")
+                return False
+
+            # Initialize Firebase if not already done
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(str(service_account_path))
+                firebase_admin.initialize_app(cred, {
+                    'storageBucket': 'ppoflipperopus.firebasestorage.app'
+                })
+
+            _firebase_bucket = storage.bucket()
+            logger.info(f"Firebase Storage initialized successfully (bucket: {_firebase_bucket.name})")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize Firebase Storage: {e}")
+            return False
+
+
+def async_upload_checkpoint(checkpoint_path: Path, logger: logging.Logger):
+    """
+    Asynchronously upload a checkpoint to Firebase Storage.
+
+    Args:
+        checkpoint_path: Local path to the checkpoint file
+        logger: Logger instance
+    """
+    def upload_task():
+        global _firebase_bucket
+
+        if _firebase_bucket is None:
+            return
+
+        try:
+            # Upload to /checkpoints/ directory in Firebase Storage
+            blob_name = f"checkpoints/{checkpoint_path.name}"
+            blob = _firebase_bucket.blob(blob_name)
+
+            # Upload with metadata
+            blob.metadata = {
+                'uploaded_at': datetime.now().isoformat(),
+                'source': 'multiprocess_training'
+            }
+
+            blob.upload_from_filename(str(checkpoint_path))
+            logger.info(f"[Firebase] ✓ Uploaded checkpoint to gs://{_firebase_bucket.name}/{blob_name}")
+
+        except Exception as e:
+            logger.error(f"[Firebase] Failed to upload checkpoint {checkpoint_path.name}: {e}")
+
+    # Run upload in background thread
+    thread = threading.Thread(target=upload_task, daemon=True)
+    thread.start()
 
 
 def setup_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
@@ -169,15 +269,23 @@ def gradient_coordinator(
         initial_timesteps: Starting timestep count (for resumed training)
     """
     logger.info("[Coordinator] Starting gradient coordinator")
+
+    # Initialize Firebase Storage for async checkpoint uploads
+    firebase_enabled = init_firebase_storage(logger)
+    if firebase_enabled:
+        logger.info("[Coordinator] Checkpoints will be uploaded to Firebase Storage")
+    else:
+        logger.info("[Coordinator] Checkpoints will only be saved locally")
+
     if initial_timesteps > 0:
         logger.info(f"[Coordinator] *** RESUMING TRAINING ***")
         logger.info(f"[Coordinator] Starting from step {initial_timesteps} (update {initial_update_count})")
     else:
         logger.info(f"[Coordinator] Starting fresh training from step 0")
-    
+
     update_count = initial_update_count
     total_timesteps = initial_timesteps
-    
+
     # Initialize shared model tracking (important for first save)
     shared_model.n_updates = update_count
     shared_model.total_timesteps = total_timesteps
@@ -244,32 +352,58 @@ def gradient_coordinator(
             shared_model.optimizer.step()
             update_count += 1
             total_timesteps += total_steps_this_update
-            
+
+            # Step learning rate scheduler
+            if shared_model.scheduler is not None:
+                shared_model.scheduler.step()
+                current_lr = shared_model.scheduler.get_last_lr()[0]
+                if update_count % 10 == 0:  # Log LR every 10 updates
+                    logger.info(f"[Coordinator] Learning rate: {current_lr:.6f}")
+
             # Update shared model tracking variables BEFORE saving
             shared_model.n_updates = update_count
             shared_model.total_timesteps = total_timesteps
             
+            # Compute gradient norm for monitoring
+            total_grad_norm = 0.0
+            for param in shared_model.all_parameters:
+                if param.grad is not None:
+                    total_grad_norm += param.grad.norm().item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
+
             # Log aggregated metrics
             avg_loss = np.mean([info['loss'] for info in loss_infos])
             avg_pg_loss = np.mean([info['pg_loss'] for info in loss_infos])
             avg_value_loss = np.mean([info['value_loss'] for info in loss_infos])
+            avg_entropy = np.mean([info.get('entropy_loss', 0) for info in loss_infos])
+            avg_clip_frac = np.mean([info.get('clip_fraction', 0) for info in loss_infos])
             logger.info(
                 f"[Coordinator] Update {update_count}: "
-                f"SHARED MODEL UPDATED - "
-                f"loss={avg_loss:.4f}, pg_loss={avg_pg_loss:.4f}, value_loss={avg_value_loss:.4f}, "
-                f"total_steps={total_timesteps}"
+                f"loss={avg_loss:.4f}, pg={avg_pg_loss:.4f}, val={avg_value_loss:.4f}, "
+                f"ent={avg_entropy:.4f}, clip={avg_clip_frac:.3f}, grad_norm={total_grad_norm:.4f}, "
+                f"steps={total_timesteps:,}"
             )
             
             # Signal workers that parameters are updated
             param_update_event.set()
             logger.info("[Coordinator] Parameters updated, signaled workers")
-            
+
+            # Wait at second barrier for all workers to load updated parameters
+            try:
+                barrier.wait(timeout=60)
+                logger.info("[Coordinator] All workers loaded updated parameters")
+            except Exception as e:
+                logger.warning(f"[Coordinator] Post-update barrier failed: {e}")
+
             # Save shared model checkpoint periodically
             if update_count % 5 == 0:  # Save every 5 updates
                 checkpoint_path = save_dir / f"shared_model_step_{total_timesteps}.pt"
                 shared_model.save(str(checkpoint_path))
                 logger.info(f"[Coordinator] ✓ SHARED MODEL CHECKPOINT SAVED: {checkpoint_path.name} (steps={total_timesteps}, updates={update_count})")
-                
+
+                # Async upload to Firebase Storage
+                async_upload_checkpoint(checkpoint_path, logger)
+
                 # Manage checkpoint count
                 if max_checkpoints > 0:
                     manage_checkpoints(save_dir, None, max_checkpoints, logger)
@@ -393,10 +527,19 @@ def worker_process(
         
         obs, info = env.reset()
         logger.info("Starting training loop...")
-        
+
+        # CRITICAL: Sync parameters from shared model BEFORE collecting any data
+        # This ensures all workers start with the same weights
+        if shared_model is not None:
+            logger.info(f"[Worker {worker_id}] Syncing initial parameters from shared model...")
+            agent.actor.load_state_dict(shared_model.actor.state_dict())
+            agent.critic.load_state_dict(shared_model.critic.state_dict())
+            agent.feature_extractor.load_state_dict(shared_model.feature_extractor.state_dict())
+            logger.info(f"[Worker {worker_id}] ✓ Initial parameters synced from SHARED MODEL")
+
         start_time = time.time()
         last_log_time = start_time
-        
+
         # Progress bar for this worker
         pbar = tqdm(
             total=max_steps,
@@ -405,7 +548,7 @@ def worker_process(
             leave=True,
             bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
         )
-        
+
         while step < max_steps and not stop_event.is_set():
             # Collect rollout
             rollout_start_step = step
@@ -518,17 +661,26 @@ def worker_process(
                     except Exception as e:
                         logger.error(f"Barrier wait failed: {e}. Worker will exit.")
                         raise RuntimeError(f"Worker {worker_id} barrier synchronization failed") from e
-                
+
                 # Wait for parameter update from coordinator
                 param_update_event.wait()
-                param_update_event.clear()
                 logger.info("Parameter update event received")
-                
+
                 # Load updated parameters from shared model
                 agent.actor.load_state_dict(shared_model.actor.state_dict())
                 agent.critic.load_state_dict(shared_model.critic.state_dict())
                 agent.feature_extractor.load_state_dict(shared_model.feature_extractor.state_dict())
                 logger.info("✓ Loaded updated parameters from SHARED MODEL")
+
+                # Second barrier to ensure all workers have loaded params before clearing event
+                try:
+                    barrier.wait(timeout=60)
+                except Exception as e:
+                    logger.warning(f"Post-update barrier failed: {e}")
+
+                # Only worker 0 clears the event to avoid race condition
+                if worker_id == 0:
+                    param_update_event.clear()
                 
             else:
                 # Independent training (original behavior)
@@ -783,7 +935,18 @@ def main():
         
         logger.info(f"[OK] Shared model created: obs_dim={shared_model.obs_dim}, n_items={shared_model.n_items}")
         logger.info(f"[OK] Training will start from step {initial_timesteps}")
-        
+
+        # Setup learning rate scheduler for better convergence
+        # Linear warmup for first 1% of training, then cosine annealing
+        total_updates = (TRAIN_KWARGS["max_steps_per_worker"] // PPO_KWARGS["rollout_steps"]) * num_workers
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        shared_model.scheduler = CosineAnnealingLR(
+            shared_model.optimizer,
+            T_max=total_updates,
+            eta_min=PPO_KWARGS["lr"] * 0.1  # Decay to 10% of initial LR
+        )
+        logger.info(f"[OK] Learning rate scheduler: CosineAnnealingLR over {total_updates} updates")
+
         # Share model parameters across processes
         shared_model.actor.share_memory()
         shared_model.critic.share_memory()
