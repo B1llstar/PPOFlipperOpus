@@ -339,10 +339,9 @@ def gradient_coordinator(
     try:
         while not stop_event.is_set():
             # Wait at barrier for all workers to submit gradients
-            # With 16384 rollout steps, workers take longer - use 30 min timeout
             logger.info("[Coordinator] Waiting at barrier for workers to submit gradients...")
             try:
-                barrier.wait(timeout=1800)  # 30 minute timeout for large rollouts
+                barrier.wait(timeout=600)  # 10 minute timeout to match workers
                 logger.info("[Coordinator] All workers reached barrier")
             except Exception as e:
                 logger.error(f"[Coordinator] Barrier wait failed (timeout or broken): {e}")
@@ -703,7 +702,7 @@ def worker_process(
                 if barrier is not None:
                     logger.info(f"[Worker {worker_id}] ⏳ Approaching barrier (step {step})...")
                     try:
-                        barrier.wait(timeout=1800)  # 30 minute timeout for large rollouts
+                        barrier.wait(timeout=600)  # 10 minute timeout
                         logger.info(f"[Worker {worker_id}] ✓ Barrier passed, waiting for parameter update...")
                     except Exception as e:
                         logger.error(f"Barrier wait failed: {e}. Worker will exit.")
@@ -919,14 +918,6 @@ def main():
         # Create shared model (on GPU 0 if available)
         device = 'cuda:0' if num_gpus > 0 else 'cpu'
         logger.info(f"Creating shared model on {device}...")
-
-        # Log GPU memory info
-        if num_gpus > 0:
-            total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            logger.info(f"[GPU] Total memory: {total_mem:.1f} GB")
-            logger.info(f"[GPU] Rollout buffer per worker: {PPO_KWARGS['rollout_steps']} steps")
-            logger.info(f"[GPU] Minibatch size: {PPO_KWARGS['minibatch_size']}")
-            logger.info(f"[GPU] PPO epochs: {PPO_KWARGS['ppo_epochs']}")
         
         # Need to create a dummy environment to get item metadata
         from training.ge_environment import GrandExchangeEnv

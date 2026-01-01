@@ -1,20 +1,20 @@
 """
 Multiprocess PPO Configuration
 
-MAXIMUM UTILIZATION settings for H100 SXM 80GB.
-Optimized for 95-100% GPU utilization + high CPU utilization.
+Production settings for H100 SXM 80GB parallel training.
+Optimized for convergence with 200 items.
 
-Strategy for max utilization:
-- Fewer workers (4) = less barrier sync overhead, each worker does MORE work
-- HUGE rollouts (16384 steps) = more data per GPU update, fewer syncs
-- MASSIVE minibatches (4096) = saturate H100 tensor cores
-- Many PPO epochs (16) = maximize GPU compute per rollout
-- Large network (1024 hidden, 4 layers) = more GPU compute per forward/backward
+Target: ~50M total environment steps for robust convergence
+- 10 workers × 5.12M steps each = 51.2M total steps
+- With 2048 rollout steps, this is ~2,500 updates per worker
+- Total training time estimate: 4-8 hours on H100
 
-Target: ~50M total environment steps
-- 4 workers × 12.8M steps each = 51.2M total steps
-- With 16384 rollout steps, this is ~782 updates per worker
-- Each update does 16 epochs of training on 16384 samples
+Key optimizations:
+- Higher learning rate (5e-4) for faster initial learning
+- Larger rollout steps (2048) for more stable gradients
+- 10 workers for stable barrier synchronization
+- Very long training (5.12M steps per worker) for proper convergence
+- Higher entropy coefficient (0.1) for better exploration with large action space
 """
 
 # Environment Configuration
@@ -25,38 +25,37 @@ ENV_KWARGS = {
     "top_n_items": 200,  # Focus on top 200 traded items for better learning signal
 }
 
-# PPO Agent Configuration - MAXIMUM GPU UTILIZATION
+# PPO Agent Configuration
 PPO_KWARGS = {
-    "hidden_size": 1024,  # Large network for more GPU compute
-    "num_layers": 4,  # Deep network
-    "lr": 3e-4,  # Slightly lower LR for stability with huge batches
-    "gamma": 0.99,  # Discount factor for future rewards
-    "gae_lambda": 0.95,  # Lambda parameter for GAE
-    "clip_epsilon": 0.2,  # PPO clipping range
-    "entropy_coef": 0.05,  # Lower entropy (less exploration needed with more data)
-    "value_coef": 0.5,  # Value function loss coefficient
-    "price_bins": 20,  # Number of discrete price levels
-    "quantity_bins": 10,  # Number of discrete quantity levels
-    "wait_steps_bins": 10,  # Number of discrete wait time options
-    "risk_tolerance": 0.3,  # Maximum portfolio allocation per item
-    # === KEY CHANGES FOR MAX GPU UTILIZATION ===
-    "rollout_steps": 16384,  # 8x larger rollouts (was 2048) - MUCH more data per sync
-    "minibatch_size": 4096,  # 16x larger batches (was 256) - saturate H100 tensor cores
-    "ppo_epochs": 16,  # 4x more epochs (was 4) - maximize GPU work per rollout
+    "hidden_size": 1024,  # Number of neurons in each hidden layer of the neural network
+    "num_layers": 4,  # Number of hidden layers in the policy and value networks
+    "lr": 5e-4,  # Higher learning rate for faster convergence
+    "gamma": 0.99,  # Discount factor for future rewards (0.99 = highly values future)
+    "gae_lambda": 0.95,  # Lambda parameter for Generalized Advantage Estimation
+    "clip_epsilon": 0.2,  # PPO clipping range to prevent large policy updates
+    "entropy_coef": 0.1,  # Higher entropy for exploration with large action space
+    "value_coef": 0.5,  # Coefficient for value function loss in total loss
+    "price_bins": 20,  # Number of discrete price levels for action space
+    "quantity_bins": 10,  # Number of discrete quantity levels for action space
+    "wait_steps_bins": 10,  # Number of discrete wait time options for action space
+    "risk_tolerance": 0.3,  # Maximum portfolio allocation per single item (30%)
+    "rollout_steps": 2048,  # Larger rollouts for more stable gradients
+    "minibatch_size": 256,  # Larger batches for H100
+    "ppo_epochs": 4,  # Fewer epochs with larger batches
 }
 
-# Training Configuration - MAXIMUM UTILIZATION
+# Training Configuration
 TRAIN_KWARGS = {
-    # FEWER workers = less barrier overhead, each worker collects more before sync
-    "num_workers": 4,  # 4 workers (was 10) - faster barrier sync, less waiting
-    "max_steps_per_worker": 12_800_000,  # 12.8M steps each = 51.2M total (same total)
-    "save_every_steps": 655_360,  # Save every ~2.6M total steps (every 10 updates)
-    "log_every_steps": 16_384,  # Log every rollout
-    "eval_every_steps": 1_310_720,  # Evaluate every ~5.2M total steps
-    "use_shared_cache": True,  # Share price data cache across workers
-    "gpu_distribution": "single",  # All on single H100
-    "use_shared_model": True,  # Enable shared model training
-    "max_checkpoints": 20,  # Keep checkpoints for analysis
+    # Reduced to 10 workers for more stable training (less barrier contention)
+    "num_workers": 10,  # 10 parallel workers - more stable than 16
+    "max_steps_per_worker": 5_120_000,  # 5.12M steps per worker = 51.2M total steps
+    "save_every_steps": 204_800,  # Save every ~3.2M total steps (every 100 updates)
+    "log_every_steps": 2_048,  # Log every rollout
+    "eval_every_steps": 409_600,  # Evaluate every ~6.5M total steps
+    "use_shared_cache": True,  # Share price data cache across workers via shared memory
+    "gpu_distribution": "single",  # All on single H100 for shared memory efficiency
+    "use_shared_model": True,  # Enable shared model training with gradient aggregation
+    "max_checkpoints": 20,  # Keep more checkpoints for analysis
 }
 
 # Evaluation Configuration
