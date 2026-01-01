@@ -190,6 +190,19 @@
     - Confirmation dialog before proceeding without bank
     - Shows reconciliation result summary
 
+#### Refactored FirebaseInventorySync.java (NEW):
+15. ✅ Refactored `FirebaseInventorySync.java` to use per-item subcollections:
+    - Summary document: `/accounts/{id}/inventory/current` (all items)
+    - Per-item documents: `/accounts/{id}/inventory/{itemId}` (individual items)
+    - Same pattern for bank: `/accounts/{id}/bank/current` and `/accounts/{id}/bank/{itemId}`
+    - Only writes changed items to per-item documents (efficient updates)
+    - Deletes per-item documents when items are removed
+16. ✅ Added `is_portfolio_item` flag to all synced items:
+    - Inventory and bank items now have `is_portfolio_item: boolean`
+    - Checks PortfolioManager for ownership status
+    - Added `setPortfolioManager()` method to wire up the check
+17. ✅ Wired PortfolioManager to FirebaseInventorySync in `GEAutoFirebaseIntegration.java`
+
 ---
 
 ## Key Design Decisions
@@ -236,6 +249,8 @@ PPO creates order (status=pending)
 - [ ] Test portfolio reconciliation with edge cases
 
 ### Future Enhancements
-- [ ] Refactor FirebaseInventorySync.java to use per-item subcollections (optional optimization)
-- [ ] Add `is_portfolio_item` flag to inventory/bank sync
-- [ ] Add startup portfolio verification
+- [x] ~~Refactor FirebaseInventorySync.java to use per-item subcollections~~ ✅ DONE
+- [x] ~~Add `is_portfolio_item` flag to inventory/bank sync~~ ✅ DONE
+- [ ] Add startup portfolio verification (auto-reconcile on login)
+Implement auto-banking logic when inventory is full
+End-to-end testinf ot he complete flow
