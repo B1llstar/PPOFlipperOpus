@@ -1,20 +1,20 @@
 """
 Multiprocess PPO Configuration
 
-EXTREME UTILIZATION settings for H100 SXM 80GB.
-Target: 70-90% VRAM usage, maximum GPU compute utilization.
+MAXIMUM UTILIZATION settings for H100 SXM 80GB.
+Optimized for 95-100% GPU utilization + high CPU utilization.
 
-Strategy:
-- MASSIVE network (2048 hidden, 6 layers) = 4x more parameters
-- HUGE rollouts (65536 steps) = tons of data per update
-- ENORMOUS minibatches (16384) = max batch for H100
-- Many PPO epochs (32) = extreme GPU compute per rollout
-- 2 workers = minimal sync overhead, each worker is a beast
+Strategy for max utilization:
+- Fewer workers (4) = less barrier sync overhead, each worker does MORE work
+- HUGE rollouts (16384 steps) = more data per GPU update, fewer syncs
+- MASSIVE minibatches (4096) = saturate H100 tensor cores
+- Many PPO epochs (16) = maximize GPU compute per rollout
+- Large network (1024 hidden, 4 layers) = more GPU compute per forward/backward
 
 Target: ~50M total environment steps
-- 2 workers × 25.6M steps each = 51.2M total steps
-- With 65536 rollout steps, this is ~391 updates per worker
-- Each update does 32 epochs of training on 65536 samples
+- 4 workers × 12.8M steps each = 51.2M total steps
+- With 16384 rollout steps, this is ~782 updates per worker
+- Each update does 16 epochs of training on 16384 samples
 """
 
 # Environment Configuration
@@ -25,34 +25,34 @@ ENV_KWARGS = {
     "top_n_items": 200,  # Focus on top 200 traded items for better learning signal
 }
 
-# PPO Agent Configuration - EXTREME GPU UTILIZATION FOR H100 80GB
+# PPO Agent Configuration - MAXIMUM GPU UTILIZATION
 PPO_KWARGS = {
-    "hidden_size": 2048,  # 2x larger network (was 1024) = 4x more compute
-    "num_layers": 6,  # Deeper network (was 4) = more GPU work per pass
-    "lr": 1e-4,  # Lower LR for stability with massive batches
+    "hidden_size": 1024,  # Large network for more GPU compute
+    "num_layers": 4,  # Deep network
+    "lr": 3e-4,  # Slightly lower LR for stability with huge batches
     "gamma": 0.99,  # Discount factor for future rewards
     "gae_lambda": 0.95,  # Lambda parameter for GAE
     "clip_epsilon": 0.2,  # PPO clipping range
-    "entropy_coef": 0.02,  # Lower entropy for huge batch stability
+    "entropy_coef": 0.05,  # Lower entropy (less exploration needed with more data)
     "value_coef": 0.5,  # Value function loss coefficient
     "price_bins": 20,  # Number of discrete price levels
     "quantity_bins": 10,  # Number of discrete quantity levels
     "wait_steps_bins": 10,  # Number of discrete wait time options
     "risk_tolerance": 0.3,  # Maximum portfolio allocation per item
-    # === EXTREME GPU UTILIZATION ===
-    "rollout_steps": 65536,  # 32x original (was 2048) - massive data per sync
-    "minibatch_size": 16384,  # 64x original (was 256) - fill H100 memory
-    "ppo_epochs": 32,  # 8x original (was 4) - tons of GPU work per rollout
+    # === KEY CHANGES FOR MAX GPU UTILIZATION ===
+    "rollout_steps": 16384,  # 8x larger rollouts (was 2048) - MUCH more data per sync
+    "minibatch_size": 4096,  # 16x larger batches (was 256) - saturate H100 tensor cores
+    "ppo_epochs": 16,  # 4x more epochs (was 4) - maximize GPU work per rollout
 }
 
-# Training Configuration - EXTREME UTILIZATION
+# Training Configuration - MAXIMUM UTILIZATION
 TRAIN_KWARGS = {
-    # Only 2 workers = minimal barrier overhead, maximum work per worker
-    "num_workers": 2,  # 2 workers - almost no sync overhead
-    "max_steps_per_worker": 25_600_000,  # 25.6M steps each = 51.2M total
-    "save_every_steps": 1_310_720,  # Save every ~2.6M total steps
-    "log_every_steps": 65_536,  # Log every rollout
-    "eval_every_steps": 2_621_440,  # Evaluate every ~5.2M total steps
+    # FEWER workers = less barrier overhead, each worker collects more before sync
+    "num_workers": 4,  # 4 workers (was 10) - faster barrier sync, less waiting
+    "max_steps_per_worker": 12_800_000,  # 12.8M steps each = 51.2M total (same total)
+    "save_every_steps": 655_360,  # Save every ~2.6M total steps (every 10 updates)
+    "log_every_steps": 16_384,  # Log every rollout
+    "eval_every_steps": 1_310_720,  # Evaluate every ~5.2M total steps
     "use_shared_cache": True,  # Share price data cache across workers
     "gpu_distribution": "single",  # All on single H100
     "use_shared_model": True,  # Enable shared model training
