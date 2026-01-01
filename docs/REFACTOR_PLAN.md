@@ -203,6 +203,18 @@
     - Added `setPortfolioManager()` method to wire up the check
 17. ✅ Wired PortfolioManager to FirebaseInventorySync in `GEAutoFirebaseIntegration.java`
 
+#### Phase 5: Manual Banking (NEW):
+18. ✅ Added `manualBankInventory()` method to `GEAutoPlugin.java`:
+    - Opens bank from GE if not already open
+    - Deposits all inventory items using `depositAll()`
+    - Syncs inventory and bank to Firebase after deposit
+    - Callback-based for async UI feedback
+19. ✅ Added "Bank Items" button to `GEAutoPanel.java`:
+    - One-click deposit of all inventory items
+    - Shows "Banking..." while in progress
+    - Displays result message when complete
+    - For testing auto-banking functionality before implementing automatic deposits
+
 ---
 
 ## Key Design Decisions
@@ -238,6 +250,7 @@ PPO creates order (status=pending)
 ## Remaining Work
 
 ### Phase 5: Inventory Management (Partial)
+- [x] Manual "Bank Items" button for testing deposit functionality ✅ DONE
 - [ ] Implement auto-banking logic when inventory is full during collection
 - [ ] Add withdraw-from-bank logic for sell orders when item not in inventory
 - [ ] Automatic location tracking when items move between inventory/bank
