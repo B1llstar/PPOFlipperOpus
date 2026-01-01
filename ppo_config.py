@@ -18,7 +18,7 @@ ENV_KWARGS = {
     "episode_length": 168,  # 1 week of hourly steps (168 hours)
     
     # Top N items to trade
-    "top_n_items": 400,  # Load 400 items for better GPU utilization
+    "top_n_items": 800,  # Load 800 items for better GPU utilization
     
     # Database/cache settings - NO DATABASE, use cache only
     "db_path": None,  # No SQLite database

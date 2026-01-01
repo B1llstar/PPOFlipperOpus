@@ -22,7 +22,7 @@ ENV_KWARGS = {
     "cache_file": "training_cache.json",  # JSON file containing cached historical price data
     "initial_cash": 1_000_000,  # Starting capital (gp) for each trading episode
     "episode_length": 864,  # Number of time steps per episode (864 = 3 days at 5min intervals)
-    "top_n_items": 200,  # Focus on top 200 traded items for better learning signal
+    "top_n_items": 800,  # Focus on top 800 traded items for better GPU utilization
 }
 
 # PPO Agent Configuration
