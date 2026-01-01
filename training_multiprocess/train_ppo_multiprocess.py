@@ -26,8 +26,10 @@ try:
     import firebase_admin
     from firebase_admin import credentials, storage
     FIREBASE_AVAILABLE = True
-except ImportError:
+    FIREBASE_IMPORT_ERROR = None
+except ImportError as e:
     FIREBASE_AVAILABLE = False
+    FIREBASE_IMPORT_ERROR = str(e)
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,45 +52,73 @@ def init_firebase_storage(logger: logging.Logger) -> bool:
     """
     global _firebase_bucket
 
+    logger.info("[Firebase] Starting Firebase Storage initialization...")
+    logger.info(f"[Firebase] FIREBASE_AVAILABLE = {FIREBASE_AVAILABLE}")
+
     if not FIREBASE_AVAILABLE:
-        logger.warning("Firebase SDK not installed. Checkpoints will only be saved locally.")
+        logger.warning(f"[Firebase] SDK not installed. Import error: {FIREBASE_IMPORT_ERROR}")
+        logger.warning("[Firebase] To install: pip install firebase-admin")
+        logger.warning("[Firebase] Checkpoints will only be saved locally.")
         return False
+
+    logger.info(f"[Firebase] firebase_admin version: {firebase_admin.__version__}")
 
     with _firebase_init_lock:
         if _firebase_bucket is not None:
-            return True  # Already initialized
+            logger.info("[Firebase] Already initialized, reusing existing bucket")
+            return True
 
         try:
             # Find service account file
+            base_path = Path(__file__).parent.parent
             service_account_paths = [
-                Path(__file__).parent.parent / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
-                Path(__file__).parent.parent / "config" / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
+                base_path / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
+                base_path / "config" / "ppoflipperopus-firebase-adminsdk-fbsvc-907a50dae7.json",
                 Path(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")),
             ]
 
+            logger.info(f"[Firebase] Searching for service account file...")
+            logger.info(f"[Firebase] Base path: {base_path}")
+
             service_account_path = None
             for path in service_account_paths:
-                if path.exists():
+                exists = path.exists() if str(path) else False
+                logger.info(f"[Firebase]   Checking: {path} -> {'EXISTS' if exists else 'NOT FOUND'}")
+                if exists:
                     service_account_path = path
                     break
 
             if service_account_path is None:
-                logger.warning("Firebase service account file not found. Checkpoints will only be saved locally.")
+                logger.warning("[Firebase] Service account file not found in any location!")
+                logger.warning("[Firebase] Expected locations:")
+                for path in service_account_paths[:2]:  # Skip empty env var path
+                    logger.warning(f"[Firebase]   - {path}")
+                logger.warning("[Firebase] Checkpoints will only be saved locally.")
                 return False
+
+            logger.info(f"[Firebase] Using service account: {service_account_path}")
 
             # Initialize Firebase if not already done
             if not firebase_admin._apps:
+                logger.info("[Firebase] No existing Firebase app, initializing new one...")
                 cred = credentials.Certificate(str(service_account_path))
                 firebase_admin.initialize_app(cred, {
                     'storageBucket': 'ppoflipperopus.firebasestorage.app'
                 })
+                logger.info("[Firebase] Firebase app initialized successfully")
+            else:
+                logger.info(f"[Firebase] Using existing Firebase app: {list(firebase_admin._apps.keys())}")
 
             _firebase_bucket = storage.bucket()
-            logger.info(f"Firebase Storage initialized successfully (bucket: {_firebase_bucket.name})")
+            logger.info(f"[Firebase] ✓ Storage initialized successfully!")
+            logger.info(f"[Firebase]   Bucket name: {_firebase_bucket.name}")
+            logger.info(f"[Firebase]   Bucket path: gs://{_firebase_bucket.name}/checkpoints/")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to initialize Firebase Storage: {e}")
+            logger.error(f"[Firebase] Failed to initialize: {e}")
+            import traceback
+            logger.error(f"[Firebase] Traceback:\n{traceback.format_exc()}")
             return False
 
 
@@ -104,9 +134,14 @@ def async_upload_checkpoint(checkpoint_path: Path, logger: logging.Logger):
         global _firebase_bucket
 
         if _firebase_bucket is None:
+            logger.warning(f"[Firebase] Skipping upload - bucket not initialized")
             return
 
         try:
+            # Get file size for logging
+            file_size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+            logger.info(f"[Firebase] Starting upload: {checkpoint_path.name} ({file_size_mb:.1f} MB)")
+
             # Upload to /checkpoints/ directory in Firebase Storage
             blob_name = f"checkpoints/{checkpoint_path.name}"
             blob = _firebase_bucket.blob(blob_name)
@@ -117,13 +152,20 @@ def async_upload_checkpoint(checkpoint_path: Path, logger: logging.Logger):
                 'source': 'multiprocess_training'
             }
 
+            start_time = time.time()
             blob.upload_from_filename(str(checkpoint_path))
+            upload_time = time.time() - start_time
+
             logger.info(f"[Firebase] ✓ Uploaded checkpoint to gs://{_firebase_bucket.name}/{blob_name}")
+            logger.info(f"[Firebase]   Size: {file_size_mb:.1f} MB, Time: {upload_time:.1f}s, Speed: {file_size_mb/upload_time:.1f} MB/s")
 
         except Exception as e:
             logger.error(f"[Firebase] Failed to upload checkpoint {checkpoint_path.name}: {e}")
+            import traceback
+            logger.error(f"[Firebase] Upload traceback:\n{traceback.format_exc()}")
 
     # Run upload in background thread
+    logger.info(f"[Firebase] Queuing async upload for {checkpoint_path.name}")
     thread = threading.Thread(target=upload_task, daemon=True)
     thread.start()
 
@@ -250,11 +292,13 @@ def gradient_coordinator(
     logger: logging.Logger,
     max_checkpoints: int = 0,
     initial_update_count: int = 0,
-    initial_timesteps: int = 0
+    initial_timesteps: int = 0,
+    save_every_updates: int = 10,
+    rollout_steps: int = 2048
 ):
     """
     Coordinator process that aggregates gradients from workers and updates shared model.
-    
+
     Args:
         num_workers: Number of worker processes
         shared_model: Shared PPOAgent model to update
@@ -267,6 +311,8 @@ def gradient_coordinator(
         max_checkpoints: Maximum number of checkpoints to keep (0 = unlimited)
         initial_update_count: Starting update count (for resumed training)
         initial_timesteps: Starting timestep count (for resumed training)
+        save_every_updates: Save checkpoint every N updates (derived from config)
+        rollout_steps: Steps per rollout (for logging)
     """
     logger.info("[Coordinator] Starting gradient coordinator")
 
@@ -396,7 +442,7 @@ def gradient_coordinator(
                 logger.warning(f"[Coordinator] Post-update barrier failed: {e}")
 
             # Save shared model checkpoint periodically
-            if update_count % 5 == 0:  # Save every 5 updates
+            if update_count % save_every_updates == 0:
                 checkpoint_path = save_dir / f"shared_model_step_{total_timesteps}.pt"
                 shared_model.save(str(checkpoint_path))
                 logger.info(f"[Coordinator] ✓ SHARED MODEL CHECKPOINT SAVED: {checkpoint_path.name} (steps={total_timesteps}, updates={update_count})")
@@ -963,11 +1009,19 @@ def main():
         
         # Start gradient coordinator process
         max_checkpoints = TRAIN_KWARGS.get('max_checkpoints', 0)
+
+        # Calculate save interval in updates from config
+        # save_every_steps / (rollout_steps * num_workers) = updates between saves
+        rollout_steps = PPO_KWARGS["rollout_steps"]
+        save_every_steps = TRAIN_KWARGS["save_every_steps"]
+        save_every_updates = max(1, save_every_steps // (rollout_steps * num_workers))
+        logger.info(f"[OK] Save checkpoint every {save_every_updates} updates (~{save_every_steps:,} total steps)")
+
         coordinator = mp.Process(
             target=gradient_coordinator,
-            args=(num_workers, shared_model, gradient_queue, param_update_event, 
+            args=(num_workers, shared_model, gradient_queue, param_update_event,
                   barrier, stop_event, save_dir, setup_logger("Coordinator", str(log_dir / "coordinator.log")),
-                  max_checkpoints, initial_update_count, initial_timesteps),
+                  max_checkpoints, initial_update_count, initial_timesteps, save_every_updates, rollout_steps),
             daemon=False
         )
         coordinator.start()
