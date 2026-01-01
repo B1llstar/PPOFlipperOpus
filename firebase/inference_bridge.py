@@ -181,14 +181,30 @@ class InferenceBridge:
         Returns:
             Order ID if successful, None otherwise
         """
-        # Validate
+        # Validate basic params
         if not self._validate_order(item_id, quantity, price, "sell"):
             return None
 
-        # Check if we have the item in inventory (what the bot can actually sell)
+        # CRITICAL: Check if we own this item in the PPO portfolio
+        # PPO can only sell items it has acquired through buy orders
+        portfolio_qty = self.portfolio_tracker.ppo_portfolio.get_portfolio_quantity(item_id)
+        if portfolio_qty < quantity:
+            logger.warning(
+                f"Cannot sell: item {item_name} (ID: {item_id}) - "
+                f"portfolio has {portfolio_qty}, trying to sell {quantity}"
+            )
+            return None
+
+        # Also verify physical availability in inventory/bank
         inventory_qty = self.get_inventory_item_quantity(item_id)
-        if inventory_qty < quantity:
-            logger.warning(f"Insufficient inventory for sell: have {inventory_qty}, need {quantity}")
+        bank_qty = self.portfolio_tracker.get_bank_item_quantity(item_id)
+        total_available = inventory_qty + bank_qty
+
+        if total_available < quantity:
+            logger.warning(
+                f"Cannot sell: physical availability insufficient - "
+                f"have {total_available} (inv: {inventory_qty}, bank: {bank_qty}), need {quantity}"
+            )
             return None
 
         order_id = self.order_manager.create_sell_order(
@@ -203,7 +219,7 @@ class InferenceBridge:
 
         if order_id:
             self._pending_order_ids.append(order_id)
-            logger.info(f"Submitted sell order: {order_id}")
+            logger.info(f"Submitted sell order: {order_id} for {quantity}x {item_name}")
 
         return order_id
 

@@ -3,6 +3,20 @@ Firebase Configuration for PPO Inference.
 
 This module contains all configuration settings for Firebase integration
 with the PPO inference server.
+
+Schema Overview:
+/accounts/{accountId}          - Parent collection (one per character)
+  /orders/{orderId}            - Buy/sell orders (status tracking)
+  /portfolio/{itemId}          - Accumulated items from buy orders minus sells
+  /inventory/{itemId}          - Current inventory items with portfolio flag
+  /bank/{itemId}               - Current bank items with portfolio flag
+  /trades/{tradeId}            - Completed trade records
+  /actions/{actionId}          - Action audit log
+  /ge_slots/current            - GE slot states
+  /commands/{commandId}        - Commands from PPO to plugin
+
+/items/{itemId}                - Item metadata (IDs, prices)
+/itemNames/{normalizedName}    - Item name to ID mapping
 """
 
 import os
@@ -43,6 +57,115 @@ SERVICE_ACCOUNT_PATH = get_service_account_path()
 # IMPORTANT: This must match the player name in RuneLite (lowercased, spaces replaced with underscores)
 # The Java plugin uses client.getLocalPlayer().getName().toLowerCase().replace(" ", "_")
 DEFAULT_ACCOUNT_ID = os.environ.get("PPO_ACCOUNT_ID", "b1llstar")
+
+# ============================================================================
+# Collection and Field Constants (matching Java FirebaseConfig.java)
+# ============================================================================
+
+# Top-Level Collection Names
+COLLECTION_ITEMS = "items"
+COLLECTION_ITEM_NAMES = "itemNames"
+COLLECTION_ACCOUNTS = "accounts"
+COLLECTION_MARKET_DATA = "market_data"
+
+# Account Subcollection Names
+SUBCOLLECTION_ORDERS = "orders"
+SUBCOLLECTION_TRADES = "trades"
+SUBCOLLECTION_PORTFOLIO = "portfolio"
+SUBCOLLECTION_INVENTORY = "inventory"
+SUBCOLLECTION_BANK = "bank"
+SUBCOLLECTION_ACTIONS = "actions"
+SUBCOLLECTION_GE_SLOTS = "ge_slots"
+SUBCOLLECTION_COMMANDS = "commands"
+
+# Document Names
+DOC_CURRENT = "current"
+DOC_SNAPSHOT = "snapshot"
+DOC_SUMMARY = "summary"
+
+# Command Types (PPO -> Plugin)
+CMD_WITHDRAW = "withdraw"
+CMD_DEPOSIT = "deposit"
+CMD_DEPOSIT_ALL = "deposit_all"
+CMD_OPEN_BANK = "open_bank"
+CMD_CLOSE_BANK = "close_bank"
+CMD_OPEN_GE = "open_ge"
+CMD_CLOSE_GE = "close_ge"
+CMD_SYNC_PORTFOLIO = "sync_portfolio"
+CMD_SYNC_ORDERS = "sync_orders"
+
+# Command Status
+CMD_STATUS_PENDING = "pending"
+CMD_STATUS_RECEIVED = "received"
+CMD_STATUS_EXECUTING = "executing"
+CMD_STATUS_COMPLETED = "completed"
+CMD_STATUS_FAILED = "failed"
+
+# Order Status Values (matching Java side)
+STATUS_PENDING = "pending"
+STATUS_RECEIVED = "received"
+STATUS_PLACED = "placed"
+STATUS_PARTIAL = "partial"
+STATUS_COMPLETED = "completed"
+STATUS_CANCELLED = "cancelled"
+STATUS_FAILED = "failed"
+
+# Action Types
+ACTION_BUY = "buy"
+ACTION_SELL = "sell"
+ACTION_WITHDRAW = "withdraw"
+ACTION_DEPOSIT = "deposit"
+ACTION_CANCEL = "cancel"
+ACTION_COLLECT = "collect"
+
+# Order Source (who created the order)
+SOURCE_PPO = "ppo"
+SOURCE_MANUAL = "manual"
+
+# Order Field Names
+FIELD_ORDER_ID = "order_id"
+FIELD_ITEM_ID = "item_id"
+FIELD_ITEM_NAME = "item_name"
+FIELD_ACTION = "action"
+FIELD_QUANTITY = "quantity"
+FIELD_PRICE = "price"
+FIELD_STATUS = "status"
+FIELD_CREATED_AT = "created_at"
+FIELD_UPDATED_AT = "updated_at"
+FIELD_COMPLETED_AT = "completed_at"
+FIELD_GE_SLOT = "ge_slot"
+FIELD_ERROR_MESSAGE = "error_message"
+FIELD_FILLED_QUANTITY = "filled_quantity"
+FIELD_METADATA = "metadata"
+FIELD_SOURCE = "source"
+FIELD_GOLD_EXCHANGED = "gold_exchanged"
+FIELD_TAX_PAID = "tax_paid"
+
+# Portfolio Field Names
+FIELD_AVG_COST = "avg_cost"
+FIELD_TOTAL_INVESTED = "total_invested"
+FIELD_LOCATION = "location"
+FIELD_TRADES = "trades"
+
+# Location Values (where portfolio items are stored)
+LOCATION_INVENTORY = "inventory"
+LOCATION_BANK = "bank"
+LOCATION_MIXED = "mixed"
+
+# Inventory/Bank Field Names
+FIELD_SLOT = "slot"
+FIELD_TAB = "tab"
+FIELD_IS_PORTFOLIO_ITEM = "is_portfolio_item"
+FIELD_NOTED = "noted"
+
+# Common Field Names
+FIELD_GOLD = "gold"
+FIELD_ITEMS = "items"
+FIELD_TOTAL_VALUE = "total_value"
+FIELD_TOTAL_COST = "total_cost"
+
+# GE Tax Rate
+GE_TAX_RATE = 0.01  # 1%
 
 # ============================================================================
 # Timing Configuration

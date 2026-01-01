@@ -7,6 +7,24 @@ This module handles the PPO → Plugin direction of communication:
 - Cancel orders
 - Listen for status updates
 - Automatically update position tracking on order completion
+
+Schema:
+/accounts/{accountId}/orders/{orderId}
+  - order_id: string
+  - action: "buy" | "sell"
+  - item_id: number
+  - item_name: string
+  - quantity: number
+  - price: number
+  - status: "pending" | "received" | "placed" | "partial" | "completed" | "cancelled" | "failed"
+  - ge_slot: number (1-8)
+  - filled_quantity: number
+  - gold_exchanged: number (net gold change)
+  - tax_paid: number
+  - source: "ppo" | "manual"
+  - created_at: timestamp
+  - updated_at: timestamp
+  - completed_at: timestamp
 """
 
 import logging
@@ -19,6 +37,22 @@ from google.cloud.firestore_v1 import DocumentSnapshot
 
 from .firebase_client import FirebaseClient
 from .position_tracker import PositionTracker
+
+# Import config constants
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.firebase_config import (
+    SOURCE_PPO, SOURCE_MANUAL,
+    FIELD_ORDER_ID, FIELD_ITEM_ID, FIELD_ITEM_NAME, FIELD_ACTION,
+    FIELD_QUANTITY, FIELD_PRICE, FIELD_STATUS, FIELD_CREATED_AT,
+    FIELD_UPDATED_AT, FIELD_COMPLETED_AT, FIELD_GE_SLOT,
+    FIELD_ERROR_MESSAGE, FIELD_FILLED_QUANTITY, FIELD_METADATA,
+    FIELD_SOURCE, FIELD_GOLD_EXCHANGED, FIELD_TAX_PAID,
+    STATUS_PENDING, STATUS_RECEIVED, STATUS_PLACED, STATUS_PARTIAL,
+    STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED,
+    ACTION_BUY, ACTION_SELL, GE_TAX_RATE
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,19 +193,22 @@ class OrderManager:
             now = self._now_iso()
 
             order_data = {
-                "order_id": order_id,
-                "item_id": item_id,
-                "item_name": item_name,
-                "action": action.value,
-                "quantity": quantity,
-                "price": price,
-                "status": OrderStatus.PENDING.value,
-                "created_at": now,
-                "updated_at": now,
-                "ge_slot": None,
-                "filled_quantity": 0,
-                "error_message": None,
-                "metadata": {
+                FIELD_ORDER_ID: order_id,
+                FIELD_ITEM_ID: item_id,
+                FIELD_ITEM_NAME: item_name,
+                FIELD_ACTION: action.value,
+                FIELD_QUANTITY: quantity,
+                FIELD_PRICE: price,
+                FIELD_STATUS: STATUS_PENDING,
+                FIELD_SOURCE: SOURCE_PPO,  # Mark as PPO-created order
+                FIELD_CREATED_AT: now,
+                FIELD_UPDATED_AT: now,
+                FIELD_GE_SLOT: None,
+                FIELD_FILLED_QUANTITY: 0,
+                FIELD_GOLD_EXCHANGED: 0,
+                FIELD_TAX_PAID: 0,
+                FIELD_ERROR_MESSAGE: None,
+                FIELD_METADATA: {
                     "confidence": confidence,
                     "strategy": strategy,
                     **(metadata or {})
@@ -185,7 +222,7 @@ class OrderManager:
             # Track locally
             self._pending_orders[order_id] = order_data
 
-            logger.info(f"Created {action.value} order: {order_id} - {quantity}x {item_name} @ {price}")
+            logger.info(f"Created {action.value} order: {order_id} - {quantity}x {item_name} @ {price} (source: ppo)")
             return order_id
 
         except Exception as e:

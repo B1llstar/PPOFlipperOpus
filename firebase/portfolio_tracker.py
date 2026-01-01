@@ -5,6 +5,10 @@ This module provides:
 - Real-time portfolio updates (gold, inventory)
 - Account state monitoring
 - Holdings queries
+- Integration with PortfolioManager for PPO-owned items
+
+The portfolio tracker reads from the plugin's sync data (inventory, bank, ge_slots)
+while the PortfolioManager tracks PPO-owned items specifically.
 """
 
 import logging
@@ -12,6 +16,17 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any, Callable
 
 from .firebase_client import FirebaseClient
+from .portfolio_manager import PortfolioManager
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.firebase_config import (
+    SUBCOLLECTION_PORTFOLIO, SUBCOLLECTION_INVENTORY, SUBCOLLECTION_BANK,
+    SUBCOLLECTION_GE_SLOTS, DOC_CURRENT,
+    FIELD_GOLD, FIELD_ITEMS, FIELD_TOTAL_VALUE, FIELD_UPDATED_AT,
+    FIELD_IS_PORTFOLIO_ITEM, FIELD_QUANTITY, FIELD_ITEM_ID, FIELD_ITEM_NAME
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +40,7 @@ class PortfolioTracker:
     - Inventory holdings
     - GE slot availability
     - Account status
+    - PPO portfolio access via PortfolioManager
     """
 
     def __init__(self, client: Optional[FirebaseClient] = None):
@@ -38,6 +54,9 @@ class PortfolioTracker:
         # Cached state
         self._current_portfolio: Optional[Dict[str, Any]] = None
         self._current_account: Optional[Dict[str, Any]] = None
+
+        # PPO Portfolio Manager for tracking owned items
+        self.ppo_portfolio = PortfolioManager(self.client)
 
     # =========================================================================
     # Portfolio Listening
